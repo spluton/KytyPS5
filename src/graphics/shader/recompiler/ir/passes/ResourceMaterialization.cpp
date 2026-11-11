@@ -254,9 +254,31 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		    (descriptor.Stride() & (alignment - 1u)) != 0u ||
 		    (descriptor.Base48() & (alignment - 1u)) != 0u)
 			return SpecializationFail("indirect formatted buffers require aligned full-format records");
-	} else if ((!indexed && descriptor.Stride() != 1u) ||
-	           (indexed && resource.max_byte_extent != 1u && descriptor.Stride() != 4u)) {
-		return SpecializationFail("indirect buffer stores require exact linear DWORD or byte bounds");
+	} else if (!indexed && descriptor.Stride() != 1u) {
+		return SpecializationFail(fmt::format(
+		    "indirect buffer stores require exact linear DWORD or byte bounds: "
+		    "descriptor={:08x},{:08x},{:08x},{:08x} base={:#x} stride={} records={} "
+		    "indexed={} max_extent={}",
+		    value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3], descriptor.Base48(),
+		    descriptor.Stride(), descriptor.NumRecords(), indexed, resource.max_byte_extent));
+	} else if (indexed && resource.max_byte_extent != 1u && descriptor.Stride() != 4u) {
+		// A record-contiguous indexed buffer (record bytes == stride, a DWORD multiple) is a
+		// linear DWORD array with records * stride / 4 entries; every access touches record
+		// boundaries, so the bounds and addressing are preserved by the rewrite (Crimson
+		// Desert stores DWORDx2 through stride-8 descriptors).
+		if (descriptor.Stride() != resource.max_byte_extent || descriptor.Stride() < 4u ||
+		    (descriptor.Stride() & 3u) != 0u ||
+		    descriptor.NumRecords() > UINT32_MAX / (descriptor.Stride() / 4u)) {
+			return SpecializationFail(fmt::format(
+			    "indirect buffer stores require exact linear DWORD or byte bounds: "
+			    "descriptor={:08x},{:08x},{:08x},{:08x} base={:#x} stride={} records={} "
+			    "indexed={} max_extent={}",
+			    value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3],
+			    descriptor.Base48(), descriptor.Stride(), descriptor.NumRecords(), indexed,
+			    resource.max_byte_extent));
+		}
+		value.dwords[1] = (value.dwords[1] & ~uint32_t {0x3FFFu << 16u}) | (4u << 16u);
+		value.dwords[2] = descriptor.NumRecords() * (descriptor.Stride() / 4u);
 	}
 	return true;
 }
@@ -682,6 +704,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			    : indirect.table_offset % step) & ~uint64_t {3}) +
 			                       (indirect.table_immediate & ~3u);
 			if (!indirect.table_maximum) domain /= step;
+			// A scalar-address table has no descriptor bounds: the bounded key domain defines
+			// the extent the heap has to cover.
+			if (table_value.dword_count == 2u && indirect.table_maximum) {
+				table_size = first + domain * step;
+			}
 			const auto count = table_size >= first + 4u
 			    ? std::min((table_size - first - 4u) / step + 1u, domain)
 			    : 0u;
