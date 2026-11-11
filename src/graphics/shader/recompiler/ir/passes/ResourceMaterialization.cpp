@@ -16,6 +16,8 @@
 #include <numeric>
 #include <unordered_set>
 
+#include "common/logging/log.h"
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
@@ -70,6 +72,26 @@ bool NullBufferDescriptor(Value value) {
 	return true;
 }
 
+// The tiling block size the host layout requires the descriptor data address to be aligned
+// to, for the mode encodings TileGetTextureBlockLayout accepts plus linear. Other encodings
+// have no address layout here and read as null images.
+uint32_t TileModeAlignment(uint32_t raw) {
+	switch (static_cast<Prospero::TileMode>(raw)) {
+		case Prospero::TileMode::kLinear:
+		case Prospero::TileMode::kStandard256B:
+			return 256u;
+		case Prospero::TileMode::kStandard4KB:
+			return 4096u;
+		case Prospero::TileMode::kStandard64KB:
+		case Prospero::TileMode::kPrt:
+		case Prospero::TileMode::kDepth:
+		case Prospero::TileMode::kRenderTarget:
+			return 65536u;
+		default:
+			return 0u;
+	}
+}
+
 bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) {
 	const auto& words = descriptor.dwords;
 	// Reject texture descriptors with nonzero reserved bits.
@@ -93,8 +115,27 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	                   type == Prospero::ImageType::kColor2DArray ||
 	                   type == Prospero::ImageType::kColor2DMsaaArray ||
 	                   type == Prospero::ImageType::kCube;
+	// A non-array type carries no array placement, and the data address must sit on a whole
+	// tiling block: broad tables otherwise decode foreign words as renderable T#s.
+	if (!array && ((words[4] >> 16u) & 0x1fffu) != 0u) {
+		return false;
+	}
 	if (array && ((words[4] >> 16u) & 0x1fffu) > (words[4] & 0x1fffu)) {
 		return false;
+	}
+	const auto address = (((static_cast<uint64_t>(words[1]) << 32u) | words[0]) & 0xFFFFFFFFFFull) << 8u;
+	if (address == 0u || (address & (static_cast<uint64_t>(TileModeAlignment((words[3] >> 20u) & 0x1fu)) -
+	                                          1u)) != 0u) {
+		return false;
+	}
+	// A compressed color surface reads its fast-clear keys from a 4 KiB-blocked metadata
+	// range, so its metadata address must sit on a block. Depth tiles ignore compression.
+	if (!r128 && (words[6] & 0x02000000u) != 0u &&
+	    static_cast<Prospero::TileMode>((words[3] >> 20u) & 0x1fu) != Prospero::TileMode::kDepth) {
+		const auto meta = ((words[6] >> 24u) & 0xffu) | (words[7] << 8u);
+		if ((meta & 0xfu) != 0u) {
+			return false;
+		}
 	}
 	const auto base_level = (words[3] >> 12u) & 0xfu;
 	const auto last_level = (words[3] >> 16u) & 0xfu;
@@ -207,6 +248,26 @@ bool ReadTable(uint64_t base, uint64_t size, uint64_t offset,
 bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t offset,
                      const SrtRuntime& runtime, std::span<uint32_t> words) {
 	return ReadTable(base & AddressMask & ~uint64_t {3}, size, offset & ~uint64_t {3}, runtime, words);
+}
+
+// A broad table's readable backing extends past its real rows, and foreign words there decode
+// as descriptors they are not. A run of consecutive rows with no valid T# ends the extent.
+constexpr uint32_t MaxInvalidTableRows = 16u;
+
+// A table row usable as a sampled image must decode as a T# the host can render (per
+// ValidImageDescriptor) with its data address mapped in guest memory. Everything else reads
+// as a null image.
+bool ValidTableRowDescriptor(const DescriptorValue& descriptor, bool r128,
+                             const SrtRuntime& runtime) {
+	if (!ValidImageDescriptor(descriptor, r128)) {
+		return false;
+	}
+	const auto address =
+	    (((static_cast<uint64_t>(descriptor.dwords[1]) << 32u) | descriptor.dwords[0]) &
+	        0xFFFFFFFFFFull)
+	    << 8u;
+	uint32_t mapped = 0u;
+	return ReadScalarTable(address, sizeof(mapped), 0u, runtime, std::span(&mapped, 1u));
 }
 
 bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource) {
@@ -668,17 +729,19 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				}
 			}
 		}
-		if (byte_keys && !use_selector) {
-			if (!indirect.table_scalar && table.Format() == Prospero::BufferFormat::kInvalid) {
+		const auto* pointer = indirect.pointer_table ? &*indirect.pointer_table : nullptr;
+		const bool image_heap = dword_count == 8u && pointer == nullptr;
+		if ((byte_keys && !use_selector) || image_heap) {
+			if (byte_keys && !indirect.table_scalar &&
+			    table.Format() == Prospero::BufferFormat::kInvalid) {
 				descriptors[resource_index] = {.dword_count = dword_count};
 				return true;
 			}
-			if (indirect.table_record_bytes != 0u &&
+			if (byte_keys && indirect.table_record_bytes != 0u &&
 			     (table.Type() != 0u || table.SwizzleEnabled() || table.AddTid() ||
 			      table.OutOfBounds() != 0u || (table_base & 3u) != 0u ||
 			      (table.Stride() & 3u) != 0u || table.Stride() < indirect.table_record_bytes))
 				return failed("table geometry");
-			const auto* pointer = indirect.pointer_table ? &*indirect.pointer_table : nullptr;
 			const bool indexed_pointer = pointer != nullptr && pointer->indexed;
 			const auto child_count = pointer != nullptr ? pointer->count : 1u;
 			uint64_t domain = indirect.table_maximum ? uint64_t {*indirect.table_maximum} + 1u
@@ -695,7 +758,6 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			     domain > table.NumRecords()))
 				return failed("indexed pointer geometry", fmt::format("rows={}", domain));
 			const bool affine = indirect.table_stride != 0u || indexed_pointer;
-			const bool image_heap = dword_count == 8u && pointer == nullptr;
 			const uint64_t step = indexed_pointer ? table.Stride()
 			    : indirect.table_maximum ? indirect.table_stride
 			    : affine ? std::max(uint64_t {1} << std::countr_zero(indirect.table_stride), uint64_t {4})
@@ -704,12 +766,14 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			    : indirect.table_offset % step) & ~uint64_t {3}) +
 			                       (indirect.table_immediate & ~3u);
 			if (!indirect.table_maximum) domain /= step;
-			// A scalar-address table has no descriptor bounds: the bounded key domain defines
-			// the extent the heap has to cover.
-			if (table_value.dword_count == 2u && indirect.table_maximum) {
+			// A scalar-address table has no descriptor bounds: cap the row domain at the
+			// probe limit and derive the extent the heap has to map from it. The guest's
+			// own index clamp keeps the reachable rows inside this extent.
+			if (table_value.dword_count == 2u) {
+				domain = std::min(domain, uint64_t {MaxIndirectDescriptorProbes});
 				table_size = first + domain * step;
 			}
-			const auto count = table_size >= first + 4u
+			auto count = table_size >= first + 4u
 			    ? std::min((table_size - first - 4u) / step + 1u, domain)
 			    : 0u;
 			descriptors[resource_index] = {.dword_count = dword_count};
@@ -745,8 +809,37 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			auto& heap_words = program.material_keys;
 			if (image_heap) {
 				heap_words.resize(table_size / 4u);
-				if (!ReadScalarTable(table_base, table_size, 0u, runtime, heap_words))
-					return read_failed("image heap read", 0u, 0u, table_base, 0u, heap_words.size() * sizeof(uint32_t));
+				// A broad table's readable backing extends past its real rows, so foreign words
+				// decode as descriptors they are not (Crimson Desert binds one and the host
+				// rejects its tiling). Scan rows until a run of invalid ones ends the table and
+				// keep the extent at the last valid row: an invalid row inside the extent reads
+				// as a null image, a key past it selects the null root slot.
+				std::array<uint32_t, 8> row_words {};
+				uint64_t rows        = 0u;
+				uint32_t invalid_run = 0u;
+				for (uint32_t row = 0u; row < count; ++row) {
+					const auto row_offset = first + uint64_t {row} * step;
+					if (!ReadScalarTable(table_base, UINT64_MAX, row_offset, runtime,
+					                     std::span(row_words).first(read_dwords))) {
+						break;
+					}
+					DescriptorValue row_value {.dword_count = read_dwords};
+					std::copy_n(row_words.begin(), read_dwords, row_value.dwords.begin());
+					if (ValidTableRowDescriptor(row_value, read_dwords == 4u, runtime)) {
+						const auto table_word = row_offset / 4u;
+						if (table_word < heap_words.size()) {
+							std::copy_n(row_words.begin(),
+							            std::min<size_t>(read_dwords, heap_words.size() - table_word),
+							            heap_words.begin() + table_word);
+						}
+						rows        = uint64_t {row} + 1u;
+						invalid_run = 0u;
+					} else if (++invalid_run >= MaxInvalidTableRows) {
+						break;
+					}
+				}
+				table_size = first + rows * step;
+				count      = std::min<uint64_t>(count, rows);
 			}
 			const auto mapping_offset = snapshot.flattened_srt.size();
 			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
@@ -824,7 +917,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			}
 		} else {
 			if (!indirect.selector_mask.IsEmpty() && table_value.dword_count != 2u) return false;
-			if (!selector_keys->resolved) {
+			if (selector_keys != nullptr && !selector_keys->resolved) {
 				if (!ResolveSelectorKeys(program, indirect, material_value, runtime, keys)) return false;
 				selector_keys->resolved = true;
 			}
@@ -1091,8 +1184,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    root.indirect_mapping_offset + mapping_words > snapshot.flattened_srt.size()) {
 			return SpecializationFail("indirect image specialization has an invalid key mapping");
 		}
-		uint32_t exemplar       = ImageResource::NoIndirectImage;
-		uint32_t resource_count = 0;
+		uint32_t exemplar          = ImageResource::NoIndirectImage;
+		uint32_t resource_count    = 0;
+		uint32_t zeroed_candidates = 0u;
 		for (uint32_t resource = 0; resource < specialization.images.size(); resource++) {
 			if (specialization.images[resource].indirect_root != root_index) {
 				continue;
@@ -1163,10 +1257,24 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			     !unfiltered_coordinates && !prefix_coordinates) ||
 			    image.conversion_format != image_class.conversion_format ||
 			    (!storage_swizzle && image.shader_swizzle != image_class.shader_swizzle)) {
-				return SpecializationFail(
-				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
-				                program.info.images[root_index].first_use_pc));
+				// A broad table holds unrelated descriptors: the rows the shader never selects
+				// read as null images instead of failing the whole table.
+				// TODO: an incompatible candidate loses its real descriptor here, so a draw
+				// sampling one of those rows reads null. Binding each candidate kind through
+				// its own specialization branch keeps their contents instead.
+				++zeroed_candidates;
+				image.numeric_class     = image_class.numeric_class;
+				image.dimension         = image_class.dimension;
+				image.mip_count         = image_class.mip_count;
+				image.conversion_format = image_class.conversion_format;
+				image.shader_swizzle    = image_class.shader_swizzle;
+				image.cube              = image_class.cube;
+				snapshot.images[candidate].dwords.fill(0u);
 			}
+		}
+		if (zeroed_candidates != 0u) {
+			LOGF("indirect image table at pc 0x%08x reads %u of its candidates as null\n",
+			     program.info.images[root_index].first_use_pc, zeroed_candidates);
 		}
 	}
 	CompactImages(snapshot.images, [&](size_t index) { return !specialization.images[index].fmask; });
