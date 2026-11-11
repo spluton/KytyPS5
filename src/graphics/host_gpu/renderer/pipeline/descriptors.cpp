@@ -423,6 +423,7 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	if (!info.IsTiled()) {
 		return false;
 	}
+	const uint32_t stored_levels = physical_levels;
 	ImageInfo physical = info;
 	// A view entirely past MAX_MIP addresses its own chain starting at its base mip (PPSA02110
 	// compresses mip 1 through a T# that declares one level).
@@ -434,6 +435,17 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	physical.resources.levels = physical_levels;
 	physical.UpdateSize();
 	info.UpdateSize();
+	// A tail-class view keeps the full chain: the mips past MAX_MIP occupy the tail slots the
+	// stored chain already reserves, so both layouts share the same size (PPSA21564 samples a
+	// tail mip through a T# that declares fewer levels).
+	if (!metadata && !info.IsVolume() && base_level >= stored_levels) {
+		ImageInfo stored        = info;
+		stored.resources.levels = stored_levels;
+		stored.UpdateSize();
+		if (stored.data.size == info.data.size) {
+			return true;
+		}
+	}
 	const auto same_mip = [&](uint32_t target, uint32_t source) {
 		const auto& left  = physical.mip_layout[target];
 		const auto& right = info.mip_layout[source];
@@ -601,10 +613,41 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (!ResolveTextureMipView(desc.info, physical_levels,
 		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
 		                           view_base)) {
+			std::string parent_text;
+			const auto  parent_id = texture_cache.FindImageFromRange(address, 0x2000000, false);
+			if (parent_id) {
+				const auto& p = texture_cache.GetImage(parent_id).info;
+				parent_text = fmt::sprintf(
+				"parent image: addr=%016" PRIx64 " size=%" PRIu64 " levels=%u layers=%u "
+				"extent=%ux%ux%u tile=%u fmt=%u ftt=%u stride=%" PRIu64 "\n",
+				p.data.address, p.data.size, p.resources.levels, p.resources.layers,
+				p.extent.width, p.extent.height, p.extent.depth,
+				static_cast<uint32_t>(p.tile_mode), static_cast<uint32_t>(p.guest_format),
+				p.first_tail_level, p.tiled_slice_stride);
+			} else {
+				parent_text = fmt::sprintf("parent image: none at %016" PRIx64 "\n", address);
+			}
 			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
-			     "extent=%ux%ux%u tile=%u\n",
+			     "extent=%ux%ux%u tile=%u\n"
+			     "  addr=%016" PRIx64 " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n"
+			     "  view   levels=%u ftt=%u stride=%" PRIu64 " mip[base]: off=%012" PRIx64
+			     " sz=%012" PRIx64 " pitch=%u h=%u tx=%u ty=%u sz=%u\n"
+			     "  phys   levels=%u ftt=%u stride=%" PRIu64 " mip[0]:    off=%012" PRIx64
+			     " sz=%012" PRIx64 " pitch=%u h=%u tx=%u ty=%u sz=%u\n%s",
 			     base_level, last_level, max_mip, width, height, depth,
-			     static_cast<uint32_t>(tile));
+			     static_cast<uint32_t>(tile), address, descriptor.fields[0], descriptor.fields[1],
+			     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
+			     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7],
+			     desc.info.resources.levels, desc.info.first_tail_level,
+			     desc.info.tiled_slice_stride, desc.info.mip_layout[view_base].offset,
+			     desc.info.mip_layout[view_base].size, desc.info.mip_layout[view_base].pitch,
+			     desc.info.mip_layout[view_base].height, desc.info.mip_layout[view_base].tail_x,
+			     desc.info.mip_layout[view_base].tail_y, desc.info.mip_layout[view_base].surface_z,
+			     physical_levels, desc.info.first_tail_level, desc.info.tiled_slice_stride,
+			     desc.info.mip_layout[0].offset, desc.info.mip_layout[0].size,
+			     desc.info.mip_layout[0].pitch, desc.info.mip_layout[0].height,
+			     desc.info.mip_layout[0].tail_x, desc.info.mip_layout[0].tail_y,
+			     desc.info.mip_layout[0].surface_z, parent_text.c_str());
 		}
 	} else {
 		desc.info.UpdateSize();
