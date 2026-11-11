@@ -2933,8 +2933,9 @@ private:
 	bool IndirectBufferAccess(const Inst& inst) const {
 		const auto opcode = inst.GetOpcode();
 		if (opcode != ValueOpcode::StoreBufferU32 && opcode != ValueOpcode::StoreBufferU8 &&
-		    opcode != ValueOpcode::StoreBufferU32x4 && opcode != ValueOpcode::LoadBufferU32x2 &&
-		    opcode != ValueOpcode::LoadBufferU32x3 && opcode != ValueOpcode::LoadBufferU32x4) return false;
+		    opcode != ValueOpcode::StoreBufferU32x2 && opcode != ValueOpcode::StoreBufferU32x4 &&
+		    opcode != ValueOpcode::LoadBufferU32x2 && opcode != ValueOpcode::LoadBufferU32x3 &&
+		    opcode != ValueOpcode::LoadBufferU32x4) return false;
 		const auto index = inst.Flags<MemoryFlags>().index;
 		if (index >= m_program.memory_info.size()) return false;
 		const auto& memory = m_program.memory_info[index];
@@ -2943,6 +2944,8 @@ private:
 		    inst.Arg(3).Resolve() != Value(0u)) return false;
 		if (opcode == ValueOpcode::StoreBufferU32)
 			return !memory.formatted || (memory.idxen && memory.data_bits == 32u && memory.data_dwords == 1u);
+		if (opcode == ValueOpcode::StoreBufferU32x2)
+			return !memory.formatted && memory.data_bits == 32u && memory.data_dwords == 2u;
 		if (!memory.idxen) return false;
 		if (opcode == ValueOpcode::StoreBufferU8)
 			return !memory.formatted && memory.data_bits == 8u;
@@ -3527,7 +3530,10 @@ private:
 			plan.retain_reads = true;
 			return finish();
 		}
-		if (!legacy_store) {
+		if (!legacy_store || indexed) {
+			// Indexed stores follow the modern table path: the key indexes the descriptor
+			// table directly regardless of the record width (Crimson Desert stores DWORDx1
+			// and DWORDx2 through indexed memory-loaded descriptors).
 			if (!plan.split_offsets) {
 				const auto count = UnsignedResourceBound(key, handle);
 				if (!count.IsEmpty()) {
@@ -4050,8 +4056,34 @@ private:
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
 			}
-			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+			std::string dwords_text;
+			for (uint32_t i = 0; i < width; ++i) {
+				const auto dword = descriptor.dwords[i].Resolve();
+				const auto type  = dword.GetType();
+				if (dword.TryInstruction() != nullptr) {
+					dwords_text += fmt::format(
+					    "{}=<{}> ", i,
+					    ValueOpcodeName(dword.TryInstruction()->GetOpcode()));
+				} else if ((type & Type::ScalarReg) != Type::Void) {
+					dwords_text += fmt::format("{}=s{} ", i, RegIndex(dword.ScalarRegister()));
+				} else if ((type & Type::VectorReg) != Type::Void) {
+					dwords_text += fmt::format("{}=v{} ", i, RegIndex(dword.VectorRegister()));
+				} else if ((type & Type::U32) != Type::Void) {
+					dwords_text += fmt::format("{}={:#x} ", i, dword.U32());
+				} else {
+					dwords_text += fmt::format("{}=type{:#x} ", i, static_cast<uint32_t>(type));
+				}
+			}
+			std::string uses_text;
+			for (const auto& use: handle->Uses()) {
+				uses_text += ValueOpcodeName(use.user->GetOpcode());
+				uses_text += ' ';
+			}
+			Fail(pc, fmt::format("{} dword {} is not a valid runtime value; GPU-selected access "
+			                     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted "
+			                     "X load (expected={:#x} handle dwords: {} uses: {})",
+			                     ValueOpcodeName(expected), bad_dword,
+			                     static_cast<uint32_t>(expected), dwords_text, uses_text));
 		}
 		source = InternSource(descriptor);
 		return true;
@@ -4252,7 +4284,8 @@ private:
 			               memory.resource * 4u, handle, source)) {
 				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
 				                                                        : ResourceKind::Buffer) ||
-				    !memory.SupportsIndirectBufferLoad(op)) {
+				    !(memory.SupportsIndirectBufferLoad(op) ||
+				      memory.SupportsIndirectBufferStore(op))) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
 					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load");
