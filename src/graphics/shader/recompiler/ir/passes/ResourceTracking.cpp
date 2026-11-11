@@ -3341,10 +3341,24 @@ private:
 				}
 				if (maximum >= MaxIndirectDescriptorProbes)
 					maximum = ClampedTableMaximum(key, table_source, indirect);
-				if (maximum < MaxIndirectDescriptorProbes)
+				if (maximum < MaxIndirectDescriptorProbes) {
 					indirect.key_count = Value(maximum + 1u);
-				else if (!ProgramLoopCount(key, indirect))
-					return false;
+				} else {
+					// No static bound: the key's derivation is exec-merged SSA (Crimson
+					// Desert). A GPU-selected key over an aligned pointer table needs no
+					// enumeration — the image heap maps slot words by descriptor address,
+					// so keep the descriptor reads and accept the scalar domain. The key is
+					// not validated here: the whole point of the indirect plan is that the
+					// runtime resolves the descriptor from the table instead.
+					const auto* lane = key.Resolve().TryInstruction();
+					const bool uniform = lane != nullptr &&
+					    lane->GetOpcode() == ValueOpcode::ReadFirstLane &&
+					    table_stride != 0u && (table_stride & 31u) == 0u;
+					if (!uniform) return false;
+					indirect.table_scalar = true;
+					plan.table_read       = plan.reads[0];
+					plan.retain_reads     = true;
+				}
 			}
 			if ((table_offset & 3u) != 0u) return false;
 		} else {
