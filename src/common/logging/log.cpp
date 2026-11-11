@@ -51,6 +51,9 @@ void Initialize() {
 		sink->set_formatter(std::make_unique<spdlog::pattern_formatter>(
 		    "%v", spdlog::pattern_time_type::local, ""));
 		g_logger = new spdlog::logger("kyty", std::move(sink));
+		// TEMPORARY DIAGNOSTIC (patch 03 candidate): unbuffered guest log so the tail shows the
+		// real stop point; remove after the hang investigation or keep as patch 03.
+		g_logger->flush_on(spdlog::level::info);
 	}
 }
 
