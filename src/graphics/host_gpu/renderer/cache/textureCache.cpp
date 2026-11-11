@@ -1121,7 +1121,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		const auto address = run(slice);
 		uint8_t code = 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
-			EXIT("TextureCache: failed to read color metadata backing\n");
+			// Fast-clear detection is an optimization: the CPU cannot always read the metadata
+			// backing of a bound image here (it can end before the derived extent or hold
+			// GPU-written bytes), and the DCC decompression path handles the data regardless.
+			continue;
 		}
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {
@@ -1129,7 +1132,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		std::vector<uint8_t> bytes(mip.size);
 		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			EXIT("TextureCache: failed to read color metadata slice\n");
+			// The slice content is unreadable the same way; skip its fast-clear detection.
+			continue;
 		}
 		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
 			continue;
