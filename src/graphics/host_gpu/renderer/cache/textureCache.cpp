@@ -1016,7 +1016,11 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	constexpr uint64_t MetadataBlockSize = 0x1000;
 	if (!range.Valid() || range.address % MetadataBlockSize != 0 || layers == 0 ||
 	    range.size % layers != 0 || (range.size / layers) % MetadataBlockSize != 0) {
-		EXIT("TextureCache: color metadata slices must contain aligned 4 KiB blocks\n");
+		// A bound image can declare metadata outside the whole-4 KiB-block model the CPU
+		// tracks: PPSA25286 binds a valid 1024x1024 color target whose CB DCC register holds
+		// 0x215c. Fast-clear detection is the only consumer that needs the range; the DCC
+		// decompression path handles the data regardless.
+		return;
 	}
 	const bool volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
 	const auto first          = volume_texture ? 0u : metadata_base_layer;
@@ -1121,9 +1125,11 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		const auto address = run(slice);
 		uint8_t code = 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
-			// Fast-clear detection is an optimization: the CPU cannot always read the metadata
-			// backing of a bound image here (it can end before the derived extent or hold
-			// GPU-written bytes), and the DCC decompression path handles the data regardless.
+			// A declared metadata VA can have no backing at all: PPSA25286 binds a heap image
+			// whose data address is mapped and readable, but whose DCC metadata range was
+			// never allocated or mapped by any guest call. Fast-clear detection is the only
+			// CPU reader of the metadata and an optimization; the DCC decompression path
+			// handles the data regardless.
 			continue;
 		}
 		vk::ClearValue clear {};
@@ -1132,7 +1138,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		std::vector<uint8_t> bytes(mip.size);
 		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			// The slice content is unreadable the same way; skip its fast-clear detection.
+			// The slice content is unbacked the same way; skip its fast-clear detection.
 			continue;
 		}
 		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
