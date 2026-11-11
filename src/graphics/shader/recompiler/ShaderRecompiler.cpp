@@ -617,7 +617,12 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		LOGF("ShaderRecompiler %s native IR before resource tracking:\n%s", stage,
 		     MakeIrDump(cfg_dump, ir).c_str());
 	}
+	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " IR TrackResources\n", stage,
+	     options.shader_hash);
 	IR::TrackResources(ir, decoded, native_cfg, options.input_info);
+	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " IR TrackResources elapsed_ms=%" PRIu64
+	     "\n",
+	     stage, options.shader_hash, phase_ms());
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {
@@ -633,6 +638,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	const auto* stage = StageName(ir.stage);
+	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " SPIR-V Specialize\n", stage,
+	     options.shader_hash);
 	IR::ApplyResourceSpecialization(ir, specialization);
 	// The resource plan owns host descriptor evaluation now. Keep only dependencies consumed
 	// by GPU memory operations; bound descriptor dwords must not retain shader instructions.
@@ -676,6 +683,12 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::EliminateDeadCode(ir.blocks);
 
 	IR::CollectShaderInfo(ir, options.input_info);
+	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " SPIR-V Specialize elapsed_ms=%" PRIu64
+	     "\n",
+	     stage, options.shader_hash,
+	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	         std::chrono::steady_clock::now() - emit_begin)
+	                                .count()));
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);
