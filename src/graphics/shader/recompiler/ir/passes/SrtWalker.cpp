@@ -11,6 +11,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <tuple>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -213,12 +214,26 @@ private:
 		if (require_uniform && !m_active_mask.IsEmpty() && value == m_active_mask) return true;
 		// Integer-only dependency checks do not depend on the active EXEC mask.
 		if (!require_uniform && m_validated_dependencies.contains(inst)) return true;
+		// The result also depends on the EXEC mask in effect. Without a memo a value graph with
+		// shared operands is walked once per path, which is exponential in its depth.
+		const auto* mask       = m_active_mask.TryInstruction();
+		const bool  memoizable = m_active_mask.IsEmpty() || mask != nullptr;
+		const auto  memo_key   = std::make_tuple(inst, require_uniform, mask);
+		if (memoizable) {
+			if (const auto found = m_memo.find(memo_key); found != m_memo.end()) return found->second;
+		}
 		if (!m_visiting.insert(inst).second) {
+			++m_cycle_assumptions;
 			return !require_uniform;
 		}
-		const auto finish = [&](bool valid) {
+		const auto assumptions_before = m_cycle_assumptions;
+		const auto finish             = [&](bool valid) {
 			m_visiting.erase(inst);
 			if (valid && !require_uniform) m_validated_dependencies.insert(inst);
+			// A result that leaned on an in-progress ancestor is not final; do not remember it.
+			if (memoizable && m_cycle_assumptions == assumptions_before) {
+				m_memo.emplace(memo_key, valid);
+			}
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
@@ -362,6 +377,8 @@ private:
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
 	std::unordered_set<const Inst*> m_validated_dependencies;
+	std::map<std::tuple<const Inst*, bool, const Inst*>, bool> m_memo;
+	uint32_t                        m_cycle_assumptions = 0;
 };
 
 
