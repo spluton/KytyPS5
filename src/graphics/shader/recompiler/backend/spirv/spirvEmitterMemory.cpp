@@ -217,6 +217,38 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 	});
 }
 
+void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t value, bool coherent = false) {
+	auto&      state   = ctx.state;
+	const auto bda     = GetBdaPointer(state, address);
+	const auto present =
+	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
+	// A page that no buffer backs yet drops the store, matching the guest's absent attachment.
+	EmitIfCondition(state, present, [&]() {
+		auto pointer = state.builder.AllocateId();
+		if (coherent) {
+			const auto block = state.builder.DecoratedType(
+			    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+			                        {spv::OpMemberDecorate, {0, spv::DecorationCoherent}},
+			                        {spv::OpDecorate, {spv::DecorationBlock}}}, TypeU32(state));
+			state.builder.AddFunction(
+			    spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, block),
+			    pointer, bda);
+			const auto base = pointer;
+			pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypePhysicalU32Pointer(state), pointer,
+			                          base, ConstantU32(state, 0));
+		} else {
+			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+			                          bda);
+		}
+		constexpr uint32_t alignment = sizeof(uint32_t);
+		state.builder.AddFunction(spv::OpStore, pointer, value,
+		                          spv::MemoryAccessAlignedMask |
+		                              (coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone),
+		                          alignment);
+	});
+}
+
 uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits,
                  bool coherent = false) {
 	auto& state = ctx.state;
@@ -1027,6 +1059,26 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 	return ConstructU32Composite(state, components, values);
 }
 
+void StoreIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
+                         const uint32_t* values, uint32_t components, bool coherent) {
+	auto& state = ctx.state;
+	const auto valid_format = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
+	                                  ConstantU32(state, 0));
+	const auto base         = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+	                                 ConstantU64(state, ~uint64_t {3}));
+	for (uint32_t component = 0; component < components; ++component) {
+		const auto address = component == 0u ? base
+		                                     : Binary(state, spv::OpIAdd, TypeU64(state), base,
+		                                              ConstantU64(state, component * 4u));
+		EmitIfCondition(
+		    state,
+		    AndCondition(state, valid_format,
+		                 IndirectBufferInBounds(state, buffer, component * 4u, ConstantU32(state, 4u),
+		                                        false)),
+		    [&]() { StoreBdaDword(ctx, address, values[component], coherent); });
+	}
+}
+
 uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAccess& buffer) {
 	auto& state = ctx.state;
 	const auto geometry = state.builder.AllocateId();
@@ -1162,6 +1214,30 @@ void StoreBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t component
 	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto mem = ctx.Memory(inst);
 		const auto composite = ctx.Arg(inst, inst.NumArgs() - 2);
+		if (mem.kind == IR::ResourceKind::IndirectBuffer) {
+			const auto function = state.indirect_buffer_store_functions.at(
+			    {mem.data_bits, components, uint32_t(mem.coherent)});
+			const auto              args = IndirectBufferArgs(ctx, inst);
+			// OpFunctionCall: opcode, result type, result id, function, then the arguments.
+			constexpr uint32_t       kFirstArg = 4u;
+			std::array<uint32_t, 16> operands {spv::OpFunctionCall, TypeVoid(state),
+			                                   state.builder.AllocateId(), function,
+			                                   args[0], args[1], args[2], args[3],
+			                                   args[4], args[5], args[6], args[7]};
+			for (uint32_t component = 0; component < components; ++component) {
+				if (components == 1u) {
+					operands[kFirstArg + 8u + component] = composite;
+					continue;
+				}
+				const auto data = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data, composite,
+				                          component);
+				operands[kFirstArg + 8u + component] = data;
+			}
+			state.builder.AddFunction(
+			    std::span<const uint32_t>(operands.data(), kFirstArg + 8u + components));
+			return;
+		}
 		EmitBufferAccess(ctx, inst, mem, 0u, [&](const auto& selected, const auto& resource) {
 			const auto info = Format::GetFormatInfo(
 			    selected.formatted ? BufferFormat(ctx, selected) : Prospero::BufferFormat::kInvalid);
@@ -1345,6 +1421,54 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			const auto result = memory.formatted ? LoadIndirectFormattedX(ctx, buffer)
 			    : LoadIndirectBuffer(ctx, buffer, memory.data_bits, components, memory.coherent);
 			state.builder.AddFunction(spv::OpReturnValue, result);
+			state.builder.AddFunction(spv::OpFunctionEnd);
+		}
+	}
+}
+
+void DefineIndirectBufferStores(ValueEmitContext& ctx) {
+	auto& state = ctx.state;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			const auto components = IR::BufferComponentCount(inst.GetOpcode());
+			if (components == 0u || components > 4u) continue;
+			const auto& memory = ctx.Memory(inst);
+			if (memory.kind != IR::ResourceKind::IndirectBuffer ||
+			    !memory.SupportsIndirectBufferStore(inst.GetOpcode())) continue;
+			auto [entry, inserted] = state.indirect_buffer_store_functions.try_emplace(
+			    std::array {memory.data_bits, components, uint32_t(memory.coherent)}, 0u);
+			if (!inserted) continue;
+			const auto function = entry->second = state.builder.AllocateId();
+			const auto type      = TypeU32(state);
+			const auto void_type = TypeVoid(state);
+			// Eight descriptor/addressing parameters plus one data DWORD per component.
+			const auto param_type = components == 1u
+			    ? state.builder.Type(spv::OpTypeFunction, void_type, type, type, type, type, type,
+			                         type, type, type, type)
+			    : components == 2u
+			        ? state.builder.Type(spv::OpTypeFunction, void_type, type, type, type, type,
+			                             type, type, type, type, type, type)
+			        : components == 3u
+			            ? state.builder.Type(spv::OpTypeFunction, void_type, type, type, type, type,
+			                                 type, type, type, type, type, type, type)
+			            : state.builder.Type(spv::OpTypeFunction, void_type, type, type, type, type,
+			                                 type, type, type, type, type, type, type, type);
+			const auto name = "store_indirect_buffer_" + std::to_string(memory.data_bits) + "x" +
+			                  std::to_string(components) + (memory.coherent ? "_coherent" : "");
+			state.builder.AddName(function, name.c_str());
+			state.builder.AddFunction(spv::OpFunction, void_type, function,
+			                          spv::FunctionControlMaskNone, param_type);
+			std::array<uint32_t, 12> args {};
+			for (uint32_t index = 0; index < 8u + components; ++index) {
+				args[index] = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpFunctionParameter, type, args[index]);
+			}
+			EmitLabel(state, state.builder.AllocateId());
+			const auto buffer = PrepareIndirectBuffer(state, {args[0], args[1], args[2], args[3],
+			                                                  args[4], args[5], args[6], args[7]},
+			                                         false);
+			StoreIndirectBuffer(ctx, buffer, args.data() + 8, components, memory.coherent);
+			state.builder.AddFunction(spv::OpReturn);
 			state.builder.AddFunction(spv::OpFunctionEnd);
 		}
 	}
@@ -1684,6 +1808,8 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  type              = inst.Arg(inst.NumArgs() - 2).GetType();
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		StoreLocalFlat(ctx, inst);
+	else if (mem.kind == IR::ResourceKind::IndirectBuffer)
+		StoreBuffer(ctx, inst, buffer_components);
 	else if (buffer_components > 1u)
 		StoreBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
