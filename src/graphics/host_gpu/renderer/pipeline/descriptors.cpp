@@ -149,9 +149,17 @@ static bool IsCanonicalTextureEncoding(const ShaderTextureResource& descriptor, 
 	                                     (static_cast<uint32_t>(descriptor.TileMode()) << 20u) |
 	                                     (static_cast<uint32_t>(descriptor.Type()) << 28u);
 	const uint32_t     field4_expected = descriptor.Depth() | (descriptor.BaseArray5() << 16u);
+	// ArrayPitch, CornerSample and PrtDefColor are decoded texture fields (shaderBindings.h):
+	// a canonical descriptor may carry an array pitch or a PRT default-color flag, and the
+	// sampled/storage paths read CornerSample elsewhere, so the expected composition includes
+	// them instead of rejecting every descriptor that sets one (PPSA25286 storage writes with
+	// an array pitch). MinLodWarn5 stays out: it is a runtime LOD value, not an encoding field.
 	const uint32_t     field5_expected = (static_cast<uint32_t>(descriptor.PerfMod5()) << 20u) |
+	                                     (uint32_t {descriptor.CornerSample()} << 23u) |
 	                                     (uint32_t {descriptor.MipStatsCntEn()} << 25u) |
-	                                     (static_cast<uint32_t>(descriptor.MaxMip()) << 4u);
+	                                     (uint32_t {descriptor.PrtDefColor()} << 26u) |
+	                                     (static_cast<uint32_t>(descriptor.MaxMip()) << 4u) |
+	                                     descriptor.ArrayPitch();
 	if ((descriptor.fields[1] & field1_reserved_mask) != 0 ||
 	    (descriptor.fields[2] & field2_reserved_mask) != 0 || descriptor.fields[3] != field3_expected) {
 		return false;
