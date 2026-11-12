@@ -621,6 +621,15 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
 		desc.info.metadata.kind = ImageMetadataKind::Dcc;
 	}
+	if (resource.heap) {
+		// Image heaps keep the descriptors of unmapped textures, which PS5 never samples. An
+		// unmapped slot carries garbage mip fields that must not reach the mip-view layout
+		// check below; resolve the slot against the mapped ranges first.
+		desc.info.UpdateSize();
+		if (!m_context.IsMapped(address, desc.info.data.size)) {
+			return {.layout = vk::ImageLayout::eGeneral};
+		}
+	}
 	if (levels > physical_levels) {
 		if (!ResolveTextureMipView(desc.info, physical_levels,
 		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
