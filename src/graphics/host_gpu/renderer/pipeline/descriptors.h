@@ -24,6 +24,9 @@ struct TextureBinding {
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+	// Unique serial of the image the id was resolved against; a replaced image (freed and
+	// re-created over the same guest memory, its slot reused) invalidates the acquired view.
+	uint64_t serial = 0;
 };
 
 struct PreparedBindings {

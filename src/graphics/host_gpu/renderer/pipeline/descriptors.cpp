@@ -705,7 +705,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		(void)SelectSampledColorView(image->info.pixel_format, desc.view_info.format,
 		                             descriptor.DstSelXYZW());
 	}
-	return {id, nullptr, std::move(desc)};
+	TextureBinding binding {id, nullptr, std::move(desc)};
+	binding.serial = image->serial;
+	return binding;
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,
@@ -955,6 +957,19 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			target.desc.view_info.base_layer = target.guest_array_layer;
 			target.image_id = cache.FindImage(target.desc);
 			BindRenderTarget(target.image_id);
+		}
+	}
+	// The target re-resolve above can free an image a view was already acquired on and re-create
+	// it over the same guest memory, reusing the slot. Such bindings still name the slot but
+	// describe the replaced image; rediscover them while image identities are still final.
+	for (auto* stage: stages) {
+		const bool stale = std::any_of(stage->images.begin(), stage->images.end(),
+		                               [&](const auto& binding) {
+			                               return binding.image_id && cache.m_slot_images[binding.image_id].serial !=
+			                                                          binding.serial;
+		                               });
+		if (stale) {
+			RebindImages(*stage);
 		}
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
