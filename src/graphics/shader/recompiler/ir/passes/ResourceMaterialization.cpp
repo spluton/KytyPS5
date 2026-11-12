@@ -270,9 +270,13 @@ bool ValidTableRowDescriptor(const DescriptorValue& descriptor, bool r128,
 	return ReadScalarTable(address, sizeof(mapped), 0u, runtime, std::span(&mapped, 1u));
 }
 
-bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource) {
+bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource,
+                             bool quiet) {
 	ShaderBufferResource descriptor;
 	if (!DecodeBufferDescriptor(value, descriptor)) return false;
+	// Probe rows of a broad table fail quietly: the caller reads them as null and the table
+	// log reports the count, so only the key path prints a specialization failure.
+	const auto fail = [&](std::string&& message) { return quiet ? false : SpecializationFail(message); };
 	const bool formatted_read = resource.formatted && resource.read && !resource.written;
 	if (descriptor.Type() != 0u || descriptor.Format() == Prospero::BufferFormat::kInvalid ||
 	    (!formatted_read && (descriptor.Base48() == 0u || descriptor.GetSize() == 0u))) {
@@ -281,7 +285,7 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 	}
 	if (descriptor.SwizzleEnabled() || descriptor.AddTid() ||
 	    descriptor.OutOfBounds() != (indexed ? 0u : 3u)) {
-		return SpecializationFail(fmt::format(
+		return fail(fmt::format(
 		    "indirect buffers require exact linear index or byte bounds: "
 		    "descriptor={:08x},{:08x},{:08x},{:08x} swizzle={} add_tid={} oob={} "
 		    "indexed={} formatted={} read={} written={} max_extent={}",
@@ -292,7 +296,7 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 	if (resource.formatted) {
 		const auto format = Format::GetFormatInfo(descriptor.Format());
 		if (!indexed || format.type == Format::ComponentType::Unknown)
-			return SpecializationFail("indirect formatted buffers require a supported indexed format");
+			return fail(std::string("indirect formatted buffers require a supported indexed format"));
 		if (!formatted_read) {
 			const bool scalar = resource.max_byte_extent == 4u &&
 			    (descriptor.Format() == Prospero::BufferFormat::k32UInt ||
@@ -301,7 +305,7 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 			    descriptor.Format() == Prospero::BufferFormat::k16_16_16_16Float;
 			if ((!scalar && !rgba16) || descriptor.Stride() != format.byte_size ||
 			    descriptor.DstSelXYZW() != (rgba16 ? DstSel(4, 5, 6, 7) : DstSel(4, 0, 0, 0)))
-				return SpecializationFail("indirect formatted stores require tight identity SInt8, UInt32 or RGBA16Float records");
+				return fail(std::string("indirect formatted stores require tight identity SInt8, UInt32 or RGBA16Float records"));
 		}
 		if (formatted_read &&
 		    (descriptor.Base48() == 0u || descriptor.Stride() == 0u || descriptor.NumRecords() == 0u)) {
@@ -314,9 +318,9 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		if (descriptor.Stride() < format.byte_size ||
 		    (descriptor.Stride() & (alignment - 1u)) != 0u ||
 		    (descriptor.Base48() & (alignment - 1u)) != 0u)
-			return SpecializationFail("indirect formatted buffers require aligned full-format records");
+			return fail(std::string("indirect formatted buffers require aligned full-format records"));
 	} else if (!indexed && descriptor.Stride() != 1u) {
-		return SpecializationFail(fmt::format(
+		return fail(fmt::format(
 		    "indirect buffer stores require exact linear DWORD or byte bounds: "
 		    "descriptor={:08x},{:08x},{:08x},{:08x} base={:#x} stride={} records={} "
 		    "indexed={} max_extent={}",
@@ -330,7 +334,7 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		if (descriptor.Stride() != resource.max_byte_extent || descriptor.Stride() < 4u ||
 		    (descriptor.Stride() & 3u) != 0u ||
 		    descriptor.NumRecords() > UINT32_MAX / (descriptor.Stride() / 4u)) {
-			return SpecializationFail(fmt::format(
+			return fail(fmt::format(
 			    "indirect buffer stores require exact linear DWORD or byte bounds: "
 			    "descriptor={:08x},{:08x},{:08x},{:08x} base={:#x} stride={} records={} "
 			    "indexed={} max_extent={}",
@@ -842,6 +846,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				count      = std::min<uint64_t>(count, rows);
 			}
 			const auto mapping_offset = snapshot.flattened_srt.size();
+			uint32_t nulled_candidates = 0u;
 			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
 			for (uint32_t word = 0; word < count; ++word) {
 				const auto table_offset = affine ? first + word * step : uint64_t {word} * 4u;
@@ -869,9 +874,14 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 						            std::min<size_t>(read_dwords, heap_words.size() - table_word),
 						            candidate.dwords.begin());
 					}
-					if (!normalize(candidate))
-						return normalization_failed(table_offset, word, step,
-						                            indirect.table_maximum ? "key" : "probe");
+					if (!normalize(candidate, /*quiet=*/true)) {
+						// A broad table's probe rows hold descriptors of other resources (raw
+						// byte buffers, swizzled records) this slot never selects: they read as
+						// null buffers instead of failing the whole table. Selector keys keep
+						// failing, since those are values the shader really resolves.
+						++nulled_candidates;
+						candidate.dwords.fill(0u);
+					}
 					const auto ordinal = intern_candidate(candidate);
 					if (ordinal == 0u) continue;
 					const auto mapping_word = image_heap ? table_offset / 4u : word * child_count + child;
@@ -880,6 +890,13 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				}
 			}
 
+			if (nulled_candidates != 0u) {
+				// Only the buffer normalize can reject a candidate (the image and sampler
+				// lambdas always return true), so a nonzero count implies this call
+				// materialized a buffer and buffers[resource_index] is the right resource.
+				LOGF("indirect buffer table at pc 0x%08x reads %u of its probe rows as null\n",
+				     program.info.buffers[resource_index].first_use_pc, nulled_candidates);
+			}
 			if (descriptors.size() == children_begin) {
 				snapshot.flattened_srt.resize(mapping_offset);
 			} else {
@@ -960,8 +977,9 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		} else if (!WalkedDescriptor(program, sources[entry], candidate)) {
 			return false;
 		}
-		if (!normalize(candidate))
+		if (!normalize(candidate, /*quiet=*/false)) {
 			return normalization_failed(table_offset, key, indirect.table_stride, "key");
+		}
 		uint32_t ordinal = 0;
 		if (entry == 0 && !byte_keys) {
 			descriptors[resource_index] = candidate;
@@ -1798,11 +1816,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 					if (!MaterializeIndirectDescriptor(
 					        program, base.source, i, 4u, 4u, observed, snapshot,
 					        snapshot.buffers, specialization.buffers,
-					        [&](DescriptorValue& value) {
+					        [&](DescriptorValue& value, bool quiet) {
 						        return NormalizeIndirectBuffer(
-						            value, source->indirect_descriptor->indexed, base);
+						            value, source->indirect_descriptor->indexed, base, quiet);
 					        }))
-						return resource_failed("buffer", i, base.source, snapshot.buffers.size());
+					return resource_failed("buffer", i, base.source, snapshot.buffers.size());
 				}
 			} else if (!evaluate(base.source, snapshot.buffers[i])) {
 				return false;
@@ -1861,7 +1879,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
 			if (!MaterializeIndirectDescriptor(
 			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot, snapshot.images,
-			        specialization.images, [&](DescriptorValue& value) {
+			        specialization.images, [&](DescriptorValue& value, bool) {
 				        // A broad heap also contains resources for other typed image operations.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
 				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
@@ -1897,7 +1915,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				if (WalkedActive(program, source) && !MaterializeIndirectDescriptor(
 				        program, source, i, 4u, 4u, observed, snapshot, snapshot.samplers,
 				        specialization.samplers,
-				        [](DescriptorValue&) { return true; }))
+				        [](DescriptorValue&, bool) { return true; }))
 					return resource_failed("sampler", i, source, snapshot.samplers.size());
 			} else {
 				if (indirect != nullptr) source = indirect->sources[0];
