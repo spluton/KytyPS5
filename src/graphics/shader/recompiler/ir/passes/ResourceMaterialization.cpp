@@ -2203,6 +2203,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
 			        inst.GetOpcode() != ValueOpcode::ImageGatherRaw &&
 			        inst.GetOpcode() != ValueOpcode::ImageQueryDimensions &&
+			        inst.GetOpcode() != ValueOpcode::ImageQueryLod &&
 			        inst.GetOpcode() != ValueOpcode::ImageRead &&
 			        inst.GetOpcode() != ValueOpcode::ImageWrite);
 			memory.resource = image_remap[memory.resource];
