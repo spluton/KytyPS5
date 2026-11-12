@@ -1242,6 +1242,164 @@ private:
 		return true;
 	}
 
+	// Wave-uniform by construction: every lane-varying leaf of the derivation folds through a
+	// first-lane read (which broadcasts lane 0's value), and everything else is immediate,
+	// scalar-uniform input, deterministic uniform-preserving arithmetic or a scalar memory read
+	// whose address is wave-uniform (every lane of the wave observes the same location). Unlike
+	// the runtime validator this proves uniformity, not host evaluability: the heap resolves
+	// such keys from guest memory, so values the walker cannot reproduce are fine here.
+	// Revisiting a node counts as uniform: the only cycles in SSA run through a loop Phi, whose
+	// carried value stays uniform exactly when every non-carried input is, so a back-edge to a
+	// uniform-by-assumption node adds no lane variance (a node only reaches this check while its
+	// own inputs are still being proven uniform).
+	bool WaveUniformByConstruction(Value value, std::unordered_set<const Inst*>& visited) const {
+		value = value.Resolve();
+		if (value.IsImmediate()) return true;
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			// Scalar register inputs are wave-uniform; vector registers are not.
+			return (value.GetType() & Type::ScalarReg) != Type::Void &&
+			       (value.GetType() & Type::VectorReg) == Type::Void;
+		}
+		if (!visited.insert(inst).second) return true;
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::ReadFirstLane || op == ValueOpcode::GetUserData ||
+		    op == ValueOpcode::GetShaderBase) {
+			return true;
+		}
+		// Descriptor handles name their uniform-selected resource; the key's loads fetch a
+		// row of the table at the uniform address the handle and offset describe.
+		if (op == ValueOpcode::GetAddressResource || op == ValueOpcode::GetBufferResource ||
+		    op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+		    op == ValueOpcode::LoadBufferU32 || op == ValueOpcode::ReadConst) {
+			for (size_t index = 0; index < inst->NumArgs(); index++) {
+				if (!WaveUniformByConstruction(inst->Arg(index), visited)) return false;
+			}
+			return true;
+		}
+		if (op == ValueOpcode::Phi) {
+			for (size_t index = 0; index < inst->NumArgs(); index++) {
+				if (!WaveUniformByConstruction(inst->Arg(index), visited)) return false;
+			}
+			return true;
+		}
+		if (!IsRuntimeUniformOp(op)) return false;
+		for (size_t index = 0; index < inst->NumArgs(); index++) {
+			if (!WaveUniformByConstruction(inst->Arg(index), visited)) return false;
+		}
+		return true;
+	}
+
+	// An upper bound on the byte offset a derivation can produce, when every branch masks or
+	// scales it with immediates. The bound (and through it the heap's key_count row extent)
+	// comes only from masks, shifts and multiplications by immediates: loads and live inputs
+	// are unknown and reject the bound, so a key can never point past the mapped rows. The
+	// memo reuses shared subexpressions; an in-progress node is a cycle and has no bound.
+	bool StaticKeyBound(Value value, uint32_t& bound, std::unordered_set<const Inst*>& active,
+	                    std::map<const Inst*, std::optional<uint32_t>>& memo) const {
+		value = value.Resolve();
+		uint32_t immediate = 0;
+		if (ImmediateU32(value, immediate)) {
+			bound = immediate;
+			return true;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return false;
+		const auto found = memo.find(inst);
+		if (found != memo.end()) {
+			if (!found->second.has_value()) return false;
+			bound = *found->second;
+			return true;
+		}
+		if (!active.insert(inst).second) return false;
+		const auto finish = [&](bool known) {
+			active.erase(inst);
+			memo.emplace(inst, known ? std::optional {bound} : std::nullopt);
+			return known;
+		};
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::BitwiseAnd32) {
+			uint32_t mask = 0, left = 0, right = 0;
+			const bool left_known = StaticKeyBound(inst->Arg(0), left, active, memo);
+			const bool right_known = StaticKeyBound(inst->Arg(1), right, active, memo);
+			if (ImmediateU32(inst->Arg(0), mask) || ImmediateU32(inst->Arg(1), mask)) {
+				bound = mask;
+				return finish(true);
+			}
+			if (!left_known || !right_known) return finish(false);
+			bound = std::min(left, right);
+			return finish(true);
+		}
+		if (op == ValueOpcode::IMul32) {
+			uint32_t left = 0, right = 0;
+			if (!StaticKeyBound(inst->Arg(0), left, active, memo) ||
+			    !StaticKeyBound(inst->Arg(1), right, active, memo)) {
+				return finish(false);
+			}
+			bound = left * right;
+			return finish(true);
+		}
+		if (op == ValueOpcode::ShiftLeftLogical32 || op == ValueOpcode::ShiftRightLogical32) {
+			uint32_t shift = 0, inner = 0;
+			if (!ImmediateU32(
+			        op == ValueOpcode::ShiftLeftLogical32 ? inst->Arg(1) : inst->Arg(0), shift) ||
+			    shift >= 32u) {
+				return finish(false);
+			}
+			const auto& inner_value =
+			    op == ValueOpcode::ShiftLeftLogical32 ? inst->Arg(0) : inst->Arg(1);
+			if (!StaticKeyBound(inner_value, inner, active, memo)) return finish(false);
+			const uint64_t shifted = op == ValueOpcode::ShiftLeftLogical32
+			    ? uint64_t {inner} << shift
+			    : uint64_t {inner} >> shift;
+			if (shifted > UINT32_MAX) return finish(false);
+			bound = static_cast<uint32_t>(shifted);
+			return finish(true);
+		}
+		if (op == ValueOpcode::IAdd32) {
+			uint32_t left = 0, right = 0;
+			if (!StaticKeyBound(inst->Arg(0), left, active, memo) ||
+			    !StaticKeyBound(inst->Arg(1), right, active, memo)) {
+				return finish(false);
+			}
+			const uint64_t sum = uint64_t {left} + right;
+			if (sum > UINT32_MAX) return finish(false);
+			bound = static_cast<uint32_t>(sum);
+			return finish(true);
+		}
+		if (op == ValueOpcode::ISub32) {
+			uint32_t left = 0, right = 0;
+			if (!StaticKeyBound(inst->Arg(0), left, active, memo)) return finish(false);
+			(void)StaticKeyBound(inst->Arg(1), right, active, memo);
+			bound = left;
+			return finish(true);
+		}
+		if (op == ValueOpcode::SelectU32 || op == ValueOpcode::SelectU1) {
+			uint32_t left = 0, right = 0;
+			if (!StaticKeyBound(inst->Arg(1), left, active, memo) ||
+			    !StaticKeyBound(inst->Arg(2), right, active, memo)) {
+				return finish(false);
+			}
+			bound = std::max(left, right);
+			return finish(true);
+		}
+		if (op == ValueOpcode::ReadFirstLane) {
+			if (!StaticKeyBound(inst->Arg(0), bound, active, memo)) return finish(false);
+			return finish(true);
+		}
+		if (op == ValueOpcode::Phi) {
+			uint32_t widest = 0;
+			for (size_t index = 0; index < inst->NumArgs(); index++) {
+				uint32_t arm = 0;
+				if (!StaticKeyBound(inst->Arg(index), arm, active, memo)) return finish(false);
+				widest = std::max(widest, arm);
+			}
+			bound = widest;
+			return finish(true);
+		}
+		return finish(false);
+	}
+
 	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t& stride) const {
 		offset = 0;
 		for (;;) {
@@ -3349,11 +3507,31 @@ private:
 					// enumeration — the image heap maps slot words by descriptor address,
 					// so keep the descriptor reads and accept the scalar domain. The key is
 					// not validated here: the whole point of the indirect plan is that the
-					// runtime resolves the descriptor from the table instead.
+					// runtime resolves the descriptor from the table instead. One lane may
+					// pick the row (PPSA25286 folds a per-pixel interpolated table index
+					// through a first-lane read and a loop), so uniformity by construction
+					// replaces the syntactic first-lane check.
+					std::unordered_set<const Inst*> uniform_walk;
 					const auto* lane = key.Resolve().TryInstruction();
-					const bool uniform = lane != nullptr &&
-					    lane->GetOpcode() == ValueOpcode::ReadFirstLane &&
-					    table_stride != 0u && (table_stride & 31u) == 0u;
+					const bool aligned = table_stride != 0u && (table_stride & 31u) == 0u;
+					// The first-lane form is the proven shape: the key is lane 0's value of
+					// the row selection, and the guest's own clamps keep it in range.
+					bool uniform = aligned && lane != nullptr &&
+					    lane->GetOpcode() == ValueOpcode::ReadFirstLane;
+					if (!uniform && aligned && WaveUniformByConstruction(key, uniform_walk)) {
+						// A key derived across a loop or a first-lane fold of a lane-varying
+						// value (PPSA25286) is wave-uniform by construction. The heap maps a
+						// bounded row extent from the runtime table base, so the derivation
+						// must also bound the rows any key can reach; without such a bound a
+						// key past the extent would read unmapped descriptors.
+						std::unordered_set<const Inst*> bound_active;
+						std::map<const Inst*, std::optional<uint32_t>> bound_memo;
+						uint32_t key_bound = 0;
+						if (!StaticKeyBound(key, key_bound, bound_active, bound_memo)) {
+							return false;
+						}
+						indirect.key_count = Value(key_bound / table_stride + 1u);
+					}
 					if (!uniform) return false;
 					indirect.table_scalar = true;
 					plan.table_read       = plan.reads[0];
