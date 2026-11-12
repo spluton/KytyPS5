@@ -180,6 +180,30 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
 }
 
+// The pointer a translated device address reads or writes through; the coherent wrap keeps
+// the access ordered with the descriptor-bound buffers.
+uint32_t BdaPointerFromGuest(EmitterState& state, uint32_t bda, bool coherent) {
+	auto&      builder = state.builder;
+	auto       pointer = builder.AllocateId();
+	const auto int_type = TypeU32(state);
+	if (coherent) {
+		const auto block = builder.DecoratedType(
+		    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+		                        {spv::OpMemberDecorate, {0, spv::DecorationCoherent}},
+		                        {spv::OpDecorate, {spv::DecorationBlock}}}, int_type);
+		builder.AddFunction(spv::OpConvertUToPtr,
+		                    TypePointer(state, spv::StorageClassPhysicalStorageBuffer, block), pointer,
+		                    bda);
+		const auto base = pointer;
+		pointer = builder.AllocateId();
+		builder.AddFunction(spv::OpAccessChain, TypePhysicalU32Pointer(state), pointer, base,
+		                    ConstantU32(state, 0));
+	} else {
+		builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, bda);
+	}
+	return pointer;
+}
+
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
 	auto&      state   = ctx.state;
 	const auto bda     = GetBdaPointer(state, address);
@@ -190,23 +214,7 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 	// on negative links and would advance over zero entries forever.
 	const auto missing = ConstantU32(state, state.program.info.bvh ? ~0u : 0u);
 	return EmitValueOrDefaultIfCondition(state, present, TypeU32(state), missing, [&]() {
-		auto pointer = state.builder.AllocateId();
-		if (coherent) {
-			const auto block = state.builder.DecoratedType(
-			    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
-			                        {spv::OpMemberDecorate, {0, spv::DecorationCoherent}},
-			                        {spv::OpDecorate, {spv::DecorationBlock}}}, TypeU32(state));
-			state.builder.AddFunction(
-			    spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, block),
-			    pointer, bda);
-			const auto base = pointer;
-			pointer = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpAccessChain, TypePhysicalU32Pointer(state), pointer,
-			                          base, ConstantU32(state, 0));
-		} else {
-			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
-			                          bda);
-		}
+		const auto         pointer   = BdaPointerFromGuest(state, bda, coherent);
 		const auto         value     = state.builder.AllocateId();
 		constexpr uint32_t alignment = sizeof(uint32_t);
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
@@ -224,23 +232,7 @@ void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t value, bool
 	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
 	// A page that no buffer backs yet drops the store, matching the guest's absent attachment.
 	EmitIfCondition(state, present, [&]() {
-		auto pointer = state.builder.AllocateId();
-		if (coherent) {
-			const auto block = state.builder.DecoratedType(
-			    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
-			                        {spv::OpMemberDecorate, {0, spv::DecorationCoherent}},
-			                        {spv::OpDecorate, {spv::DecorationBlock}}}, TypeU32(state));
-			state.builder.AddFunction(
-			    spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, block),
-			    pointer, bda);
-			const auto base = pointer;
-			pointer = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpAccessChain, TypePhysicalU32Pointer(state), pointer,
-			                          base, ConstantU32(state, 0));
-		} else {
-			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
-			                          bda);
-		}
+		const auto         pointer   = BdaPointerFromGuest(state, bda, coherent);
 		constexpr uint32_t alignment = sizeof(uint32_t);
 		state.builder.AddFunction(spv::OpStore, pointer, value,
 		                          spv::MemoryAccessAlignedMask |
