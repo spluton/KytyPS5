@@ -1060,7 +1060,7 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 }
 
 void StoreIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
-                         const uint32_t* values, uint32_t components, bool coherent) {
+                         const uint32_t* values, uint32_t components, uint32_t bits, bool coherent) {
 	auto& state = ctx.state;
 	const auto valid_format = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
 	                                  ConstantU32(state, 0));
@@ -1068,14 +1068,33 @@ void StoreIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& buff
 	                                 ConstantU64(state, ~uint64_t {3}));
 	for (uint32_t component = 0; component < components; ++component) {
 		const auto address = component == 0u ? base
-		                                     : Binary(state, spv::OpIAdd, TypeU64(state), base,
-		                                              ConstantU64(state, component * 4u));
+		    : Binary(state, spv::OpIAdd, TypeU64(state), base,
+		              ConstantU64(state, component * 4u));
 		EmitIfCondition(
 		    state,
 		    AndCondition(state, valid_format,
-		                 IndirectBufferInBounds(state, buffer, component * 4u, ConstantU32(state, 4u),
-		                                        false)),
-		    [&]() { StoreBdaDword(ctx, address, values[component], coherent); });
+		                 IndirectBufferInBounds(state, buffer, component * 4u,
+		                                        ConstantU32(state, bits / 8u), false)),
+		    [&]() {
+			    if (bits == 32u) {
+				    StoreBdaDword(ctx, address, values[component], coherent);
+				    return;
+			    }
+			    // A narrow store read-modify-writes the containing DWORD: the bytes the store
+			    // does not select keep their previous contents, mirroring the narrow loads.
+			    const auto word = LoadBdaDword(ctx, address, coherent);
+			    const auto byte = Binary(
+			        state, spv::OpBitwiseAnd, TypeU32(state),
+			        Unary(state, spv::OpUConvert, TypeU32(state), buffer.address),
+			        ConstantU32(state, bits == 8u ? 3u : 2u));
+			    const auto merged = state.builder.AllocateId();
+			    state.builder.AddFunction(spv::OpBitFieldInsert, TypeU32(state), merged, word,
+			                              values[component],
+			                              Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte,
+			                                     ConstantU32(state, 3u)),
+			                              ConstantU32(state, bits));
+			    StoreBdaDword(ctx, address, merged, coherent);
+		    });
 	}
 }
 
@@ -1467,7 +1486,8 @@ void DefineIndirectBufferStores(ValueEmitContext& ctx) {
 			const auto buffer = PrepareIndirectBuffer(state, {args[0], args[1], args[2], args[3],
 			                                                  args[4], args[5], args[6], args[7]},
 			                                         false);
-			StoreIndirectBuffer(ctx, buffer, args.data() + 8, components, memory.coherent);
+			StoreIndirectBuffer(ctx, buffer, args.data() + 8, components, memory.data_bits,
+			                    memory.coherent);
 			state.builder.AddFunction(spv::OpReturn);
 			state.builder.AddFunction(spv::OpFunctionEnd);
 		}

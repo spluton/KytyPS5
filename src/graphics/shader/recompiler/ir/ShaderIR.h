@@ -98,10 +98,13 @@ struct MemoryInfo {
 	}
 
 	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
-		// Raw DWORD stores only: narrower stores need a read-modify-write of the host DWORD.
-		if (typed || formatted || data_bits != 32u) return false;
-		return opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
-		       opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4;
+		// Narrow stores read-modify-write the host DWORD inside the store function.
+		if (typed || formatted) return false;
+		if (data_bits == 8u) return opcode == ValueOpcode::StoreBufferU8;
+		if (data_bits == 16u) return opcode == ValueOpcode::StoreBufferU16;
+		return data_bits == 32u &&
+		       (opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
+		        opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
