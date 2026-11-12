@@ -4299,7 +4299,8 @@ private:
 				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
 				                                                        : ResourceKind::Buffer) ||
 				    !(memory.SupportsIndirectBufferLoad(op) ||
-				      memory.SupportsIndirectBufferStore(op))) {
+				      memory.SupportsIndirectBufferStore(op) ||
+				      memory.SupportsIndirectBufferAtomic(op))) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
 					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load");

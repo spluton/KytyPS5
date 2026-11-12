@@ -297,7 +297,9 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 		              ConstantU32(ctx.state, mem.offset));
 	}
 	if (mem.kind != IR::ResourceKind::Scratch) {
-		EXIT("physical address memory must use the BDA emitter\n");
+		EXIT("physical address memory must use the BDA emitter: kind=%d opcode=%d pc=0x%08x\n",
+		     static_cast<int>(mem.kind), static_cast<int>(inst.GetOpcode()),
+		     inst.Flags<IR::MemoryFlags>().pc);
 	}
 	return ScratchByteAddress(ctx, mem, ctx.Arg(inst, 1), ctx.Arg(inst, 2));
 }
@@ -1075,43 +1077,38 @@ void StoreIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& buff
 			    // A narrow store merges its record into the containing DWORD in a
 			    // compare-exchange loop, so lanes writing the neighbouring record cannot
 			    // clobber it; the raw storage buffer path merges subwords the same way.
-			    auto pointer = state.builder.AllocateId();
-			    if (coherent) {
-				    const auto block = state.builder.DecoratedType(
-				        spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
-				                            {spv::OpMemberDecorate, {0, spv::DecorationCoherent}},
-				                            {spv::OpDecorate, {spv::DecorationBlock}}}, TypeU32(state));
-				    state.builder.AddFunction(
-				        spv::OpConvertUToPtr,
-				        TypePointer(state, spv::StorageClassPhysicalStorageBuffer, block), pointer,
-				        address);
-				    const auto base = pointer;
-				    pointer = state.builder.AllocateId();
-				    state.builder.AddFunction(spv::OpAccessChain, TypePhysicalU32Pointer(state),
-				                              pointer, base, ConstantU32(state, 0));
-			    } else {
-				    state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
-				                              pointer, address);
-			    }
-			    const auto shift = Binary(
-			        state, spv::OpShiftLeftLogical, TypeU32(state),
-			        Binary(state, spv::OpBitwiseAnd, TypeU32(state),
-			               Unary(state, spv::OpUConvert, TypeU32(state), buffer.address),
-			               ConstantU32(state, 3)),
-			        ConstantU32(state, 3));
-			    const auto mask = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
-			                             ConstantU32(state, bits == 8u ? 0xffu : 0xffffu), shift);
-			    const auto piece = Binary(
-			        state, spv::OpShiftLeftLogical, TypeU32(state),
-			        Binary(state, spv::OpBitwiseAnd, TypeU32(state), values[component],
-			               ConstantU32(state, bits == 8u ? 0xffu : 0xffffu)),
-			        shift);
-			    AtomicUpdate(state, pointer, IR::ResourceKind::Buffer, [&](uint32_t old) {
-				    return Binary(state, spv::OpBitwiseOr, TypeU32(state),
-				                  Binary(state, spv::OpBitwiseAnd, TypeU32(state), old,
-				                         Unary(state, spv::OpNot, TypeU32(state), mask)),
-				                  piece);
-			    });
+			    const auto bda     = GetBdaPointer(state, buffer.address);
+			    const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda,
+			                                ConstantU64(state, 0));
+			    EmitIfCondition(
+			        state,
+			        AndCondition(state,
+			                     AndCondition(state, valid_format,
+			                                  IndirectBufferInBounds(state, buffer, component * 4u,
+			                                                         ConstantU32(state, bits / 8u), false)),
+			                     present),
+			        [&]() {
+				        const auto pointer = BdaPointerFromGuest(state, bda, coherent);
+				        const auto shift   = Binary(
+				            state, spv::OpShiftLeftLogical, TypeU32(state),
+				            Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+				                   Unary(state, spv::OpUConvert, TypeU32(state), buffer.address),
+				                   ConstantU32(state, 3)),
+				            ConstantU32(state, 3));
+				        const auto mask = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+				                                 ConstantU32(state, bits == 8u ? 0xffu : 0xffffu), shift);
+				        const auto piece = Binary(
+				            state, spv::OpShiftLeftLogical, TypeU32(state),
+				            Binary(state, spv::OpBitwiseAnd, TypeU32(state), values[component],
+				                   ConstantU32(state, bits == 8u ? 0xffu : 0xffffu)),
+				            shift);
+				        AtomicUpdate(state, pointer, IR::ResourceKind::Buffer, [&](uint32_t old) {
+					        return Binary(state, spv::OpBitwiseOr, TypeU32(state),
+					                      Binary(state, spv::OpBitwiseAnd, TypeU32(state), old,
+					                             Unary(state, spv::OpNot, TypeU32(state), mask)),
+					                      piece);
+				        });
+			        });
 		    });
 	}
 }

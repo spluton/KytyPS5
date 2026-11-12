@@ -122,6 +122,7 @@ struct EmitterState {
 	uint32_t                                         indirect_format_geometry_function = 0;
 	std::map<std::array<uint32_t, 4>, uint32_t>        indirect_buffer_load_functions;
 	std::map<std::array<uint32_t, 3>, uint32_t>        indirect_buffer_store_functions;
+	std::map<std::array<uint32_t, 2>, uint32_t>        indirect_buffer_atomic_functions;
 	uint32_t                                         bvh_intersect_function  = 0;
 	uint32_t                                         bvh8_result_type       = 0;
 	uint32_t                                         bvh8_intersect_function = 0;
@@ -525,6 +526,7 @@ void EmitProgram(EmitterState& state);
 void DefineGetBdaPointer(EmitterState& state);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);
 void DefineIndirectBufferStores(ValueEmitContext& ctx);
+void DefineIndirectBufferAtomics(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
 void DefineTrinityBvhIntersect(EmitterState& state);
 uint32_t BvhNode(EmitterState& state, uint32_t address);

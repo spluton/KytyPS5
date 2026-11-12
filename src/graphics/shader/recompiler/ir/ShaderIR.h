@@ -107,6 +107,22 @@ struct MemoryInfo {
 		        opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4);
 	}
 
+	[[nodiscard]] bool SupportsIndirectBufferAtomic(ValueOpcode opcode) const {
+		// The native 32-bit integer atomics; 64-bit and float min/max would need a CAS merge.
+		return !typed && !formatted && data_bits == 32u &&
+		       (opcode == ValueOpcode::BufferAtomicSwap32 ||
+		        opcode == ValueOpcode::BufferAtomicCmpSwap32 ||
+		        opcode == ValueOpcode::BufferAtomicIAdd32 ||
+		        opcode == ValueOpcode::BufferAtomicISub32 ||
+		        opcode == ValueOpcode::BufferAtomicSMin32 ||
+		        opcode == ValueOpcode::BufferAtomicUMin32 ||
+		        opcode == ValueOpcode::BufferAtomicSMax32 ||
+		        opcode == ValueOpcode::BufferAtomicUMax32 ||
+		        opcode == ValueOpcode::BufferAtomicAnd32 ||
+		        opcode == ValueOpcode::BufferAtomicOr32 ||
+		        opcode == ValueOpcode::BufferAtomicXor32);
+	}
+
 	bool operator==(const MemoryInfo& other) const = default;
 };
 
