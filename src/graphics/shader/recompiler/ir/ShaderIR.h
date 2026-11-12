@@ -98,7 +98,7 @@ struct MemoryInfo {
 	}
 
 	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
-		// Narrow stores read-modify-write the host DWORD inside the store function.
+		// Narrow stores merge their record into the host DWORD in a compare-exchange loop.
 		if (typed || formatted) return false;
 		if (data_bits == 8u) return opcode == ValueOpcode::StoreBufferU8;
 		if (data_bits == 16u) return opcode == ValueOpcode::StoreBufferU16;
