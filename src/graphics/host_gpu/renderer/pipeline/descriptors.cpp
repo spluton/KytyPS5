@@ -170,7 +170,11 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	if (r128) {
 		return true;
 	}
-	if (descriptor.MsaaDepth() && !IsMultisampledTexture(descriptor.Type())) {
+	// MSAA_DEPTH only marks the compressed tiling of a multisampled depth surface: a
+	// single-sample surface reads the same with the bit set, so a stale bit on a
+	// non-multisampled type (PPSA25286 binds a depth16 2D texture with one) reads as ignored.
+	if (descriptor.MsaaDepth() && !IsMultisampledTexture(descriptor.Type()) &&
+	    descriptor.MetaCompress()) {
 		return false;
 	}
 	// Bits 0-7 name the mip-stats counter. A clear COMPRESSION_EN disables the metadata and its
