@@ -1509,6 +1509,86 @@ void DefineIndirectBufferStores(ValueEmitContext& ctx) {
 	}
 }
 
+// Indirect buffer atomics run through the same descriptor-addressing parameters as the loads
+// and stores; only the native 32-bit integer operations are supported.
+void DefineIndirectBufferAtomics(ValueEmitContext& ctx) {
+	auto& state = ctx.state;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::Atomic) continue;
+			const auto& memory = ctx.Memory(inst);
+			if (memory.kind != IR::ResourceKind::IndirectBuffer ||
+			    !memory.SupportsIndirectBufferAtomic(inst.GetOpcode())) continue;
+			const auto atomic_opcode = inst.GetOpcode();
+			const bool compare       = atomic_opcode == IR::ValueOpcode::BufferAtomicCmpSwap32;
+			auto [entry, inserted] = state.indirect_buffer_atomic_functions.try_emplace(
+			    std::array {uint32_t(atomic_opcode), uint32_t(memory.coherent)}, 0u);
+			if (!inserted) continue;
+			const auto function = entry->second = state.builder.AllocateId();
+			const auto type      = TypeU32(state);
+			// Eight descriptor/addressing parameters, the data DWORD and, for a compare
+			// exchange, the comparator DWORD; the operation returns the previous DWORD.
+			const auto param_count = 9u + (compare ? 1u : 0u);
+			std::array<uint32_t, 11> signature {};
+			for (uint32_t word = 0; word < param_count; ++word) signature[word] = type;
+			state.builder.AddName(function,
+			                      ("atomic_indirect_buffer_" +
+			                       std::to_string(uint32_t(atomic_opcode)) +
+			                       (memory.coherent ? "_coherent" : ""))
+			                          .c_str());
+			state.builder.AddFunction(spv::OpFunction, type, function, spv::FunctionControlMaskNone,
+			                          state.builder.Type(spv::OpTypeFunction, type,
+			                                             std::span(signature).first(param_count)));
+			std::array<uint32_t, 11> args {};
+			for (uint32_t index = 0; index < param_count; ++index) {
+				args[index] = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpFunctionParameter, type, args[index]);
+			}
+			EmitLabel(state, state.builder.AllocateId());
+			const auto buffer = PrepareIndirectBuffer(state, {args[0], args[1], args[2], args[3],
+			                                                  args[4], args[5], args[6], args[7]},
+			                                         false);
+			const auto bda     = GetBdaPointer(state, buffer.address);
+			const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda,
+			                            ConstantU64(state, 0));
+			const auto old = EmitValueOrDefaultIfCondition(
+			    state,
+			    AndCondition(state,
+			                 AndCondition(state,
+			                              Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
+			                                     ConstantU32(state, 0)),
+			                              IndirectBufferInBounds(state, buffer, 0u,
+			                                                     ConstantU32(state, 4u), false)),
+			                 present),
+			    type, ConstantU32(state, 0),
+			    [&]() {
+				    const auto pointer = BdaPointerFromGuest(state, bda, memory.coherent);
+				    const auto previous = state.builder.AllocateId();
+				    const auto semantics = ConstantU32(
+				        state, spv::MemorySemanticsUniformMemoryMask |
+				                   spv::MemorySemanticsAcquireReleaseMask);
+				    // A buffer compare exchange stores DATA and compares DATA2 (opposite to the
+				    // shared-memory form). The unequal path only observes, so it takes Acquire.
+				    if (compare) {
+					    state.builder.AddFunction(spv::OpAtomicCompareExchange, type, previous,
+					                              pointer, ConstantU32(state, spv::ScopeDevice),
+					                              semantics,
+					                              ConstantU32(state, spv::MemorySemanticsUniformMemoryMask |
+					                                                 spv::MemorySemanticsAcquireMask),
+					                              args[8], args[9]);
+				    } else {
+					    state.builder.AddFunction(SpirvAtomicOpcode(atomic_opcode), type, previous,
+					                              pointer, ConstantU32(state, spv::ScopeDevice),
+					                              semantics, args[8]);
+				    }
+				    return previous;
+			    });
+			state.builder.AddFunction(spv::OpReturnValue, old);
+			state.builder.AddFunction(spv::OpFunctionEnd);
+		}
+	}
+}
+
 void DefineGetBdaPointer(EmitterState& state) {
 	if (!state.program.info.uses_dma) {
 		return;
@@ -1566,7 +1646,26 @@ void DefineGetBdaPointer(EmitterState& state) {
 }
 
 uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto& mem = ctx.Memory(inst);
+	const auto& mem   = ctx.Memory(inst);
+	auto&       state = ctx.state;
+	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
+		return EmitValueOrDefaultIfCondition(
+		    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32(state), ConstantU32(state, 0), [&]() {
+			    const auto function = state.indirect_buffer_atomic_functions.at(
+			        {uint32_t(inst.GetOpcode()), uint32_t(mem.coherent)});
+			    const auto args    = IndirectBufferArgs(ctx, inst);
+			    const bool compare = inst.GetOpcode() == IR::ValueOpcode::BufferAtomicCmpSwap32;
+			    std::array<uint32_t, 10> call {};
+			    for (size_t word = 0; word < args.size(); ++word) call[word] = args[word];
+			    // A buffer compare exchange stores DATA (the first argument) and compares DATA2.
+			    call[8] = ctx.Arg(inst, inst.NumArgs() - (compare ? 3u : 2u));
+			    if (compare) call[9] = ctx.Arg(inst, inst.NumArgs() - 2);
+			    const auto result = state.builder.AllocateId();
+			    state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), result, function,
+			                              std::span(call).first(9u + (compare ? 1u : 0u)));
+			    return result;
+		    });
+	}
 	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
 		const auto scope =
 		    mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
