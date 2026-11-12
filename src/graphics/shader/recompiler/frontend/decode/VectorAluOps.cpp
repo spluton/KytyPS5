@@ -239,11 +239,19 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0xceu, Opcode::V_CMP_GE_F16},         {0xe8u, Opcode::V_CMP_U_F16},
     {0xe9u, Opcode::V_CMP_NGE_F16},        {0xebu, Opcode::V_CMP_NGT_F16},
     {0xedu, Opcode::V_CMP_NEQ_F16},        {0xeeu, Opcode::V_CMP_NLT_F16},
+    // The F16 blocks mirror the fixed unordered-compare sequence of the F64 block: the
+    // entries here complete it between the neighbors the table already decodes.
+    {0xeau, Opcode::V_CMP_NLG_F16},        {0xecu, Opcode::V_CMP_NLE_F16},
+    {0xefu, Opcode::V_CMP_TRU_F16},
     {0xd9u, Opcode::V_CMPX_LT_F16},        {0xdau, Opcode::V_CMPX_EQ_F16},
     {0xdbu, Opcode::V_CMPX_LE_F16},        {0xdcu, Opcode::V_CMPX_GT_F16},
     {0xdeu, Opcode::V_CMPX_GE_F16},        {0xfbu, Opcode::V_CMPX_NGT_F16},
     {0xfcu, Opcode::V_CMPX_NLE_F16},       {0xfdu, Opcode::V_CMPX_NEQ_F16},
     {0xfeu, Opcode::V_CMPX_NLT_F16},
+    {0xd8u, Opcode::V_CMPX_F_F16},         {0xddu, Opcode::V_CMPX_LG_F16},
+    {0xdfu, Opcode::V_CMPX_O_F16},
+    {0xf8u, Opcode::V_CMPX_U_F16},         {0xf9u, Opcode::V_CMPX_NGE_F16},
+    {0xfau, Opcode::V_CMPX_NLG_F16},       {0xffu, Opcode::V_CMPX_TRU_F16},
 };
 
 constexpr auto VOPC_OPS = Detail::MakeOpcodeTable<0x100>(VOPC_OPCODE_LIST);
@@ -909,18 +917,28 @@ bool IsVopcFloatCompareOpcode(Opcode opcode) {
 		case Opcode::V_CMP_GE_F16:
 		case Opcode::V_CMP_U_F16:
 		case Opcode::V_CMP_NGE_F16:
+		case Opcode::V_CMP_NLG_F16:
 		case Opcode::V_CMP_NGT_F16:
+		case Opcode::V_CMP_NLE_F16:
 		case Opcode::V_CMP_NEQ_F16:
 		case Opcode::V_CMP_NLT_F16:
+		case Opcode::V_CMP_TRU_F16:
 		case Opcode::V_CMPX_LT_F16:
 		case Opcode::V_CMPX_EQ_F16:
 		case Opcode::V_CMPX_LE_F16:
 		case Opcode::V_CMPX_GT_F16:
+		case Opcode::V_CMPX_LG_F16:
 		case Opcode::V_CMPX_GE_F16:
+		case Opcode::V_CMPX_F_F16:
+		case Opcode::V_CMPX_O_F16:
+		case Opcode::V_CMPX_U_F16:
+		case Opcode::V_CMPX_NGE_F16:
+		case Opcode::V_CMPX_NLG_F16:
 		case Opcode::V_CMPX_NGT_F16:
 		case Opcode::V_CMPX_NLE_F16:
 		case Opcode::V_CMPX_NEQ_F16:
 		case Opcode::V_CMPX_NLT_F16:
+		case Opcode::V_CMPX_TRU_F16:
 		case Opcode::V_CMP_CLASS_F32:
 		case Opcode::V_CMP_CLASS_F16:
 		case Opcode::V_CMPX_CLASS_F16:
@@ -1556,11 +1574,18 @@ bool IsVopcCompareExec(Opcode opcode) {
 		case Opcode::V_CMPX_EQ_F16:
 		case Opcode::V_CMPX_LE_F16:
 		case Opcode::V_CMPX_GT_F16:
+		case Opcode::V_CMPX_LG_F16:
 		case Opcode::V_CMPX_GE_F16:
+		case Opcode::V_CMPX_F_F16:
+		case Opcode::V_CMPX_O_F16:
+		case Opcode::V_CMPX_U_F16:
+		case Opcode::V_CMPX_NGE_F16:
+		case Opcode::V_CMPX_NLG_F16:
 		case Opcode::V_CMPX_NGT_F16:
 		case Opcode::V_CMPX_NLE_F16:
 		case Opcode::V_CMPX_NEQ_F16:
-		case Opcode::V_CMPX_NLT_F16: return true;
+		case Opcode::V_CMPX_NLT_F16:
+		case Opcode::V_CMPX_TRU_F16: return true;
 		default: return false;
 	}
 }
