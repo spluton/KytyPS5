@@ -3536,23 +3536,28 @@ private:
 					// the row selection, and the guest's own clamps keep it in range.
 					bool uniform = aligned && lane != nullptr &&
 					    lane->GetOpcode() == ValueOpcode::ReadFirstLane;
-					if (!uniform && aligned && WaveUniformByConstruction(key, uniform_walk)) {
+					if (!sampler && !uniform && aligned &&
+					    WaveUniformByConstruction(key, uniform_walk)) {
 						// A key derived across a loop or a first-lane fold of a lane-varying
-						// value (PPSA25286) is wave-uniform by construction. The heap maps a
-						// bounded row extent from the runtime table base, so the derivation
-						// must also bound the rows any key can reach; without such a bound a
-						// key past the extent would read unmapped descriptors.
+						// value (PPSA25286) is wave-uniform by construction. Without a static
+						// bound the key still stays safe at runtime: the heap lookup clamps its
+						// slot index with the mapped slot count and selects the trailing null
+						// slot past it, the mapped extent caps at the probe limit, and the
+						// slot buffer allocates a cleared word past that count. Every consumer
+						// of such a key bounds-checks the same way (the image heap entry and
+						// the indirect resource index); a static bound, when derivable, only
+						// narrows the mapped rows.
 						std::unordered_set<const Inst*> bound_active;
 						std::map<const Inst*, std::optional<uint32_t>> bound_memo;
 						uint32_t key_bound = 0;
-						if (!StaticKeyBound(key, key_bound, bound_active, bound_memo)) {
-							return false;
+						if (StaticKeyBound(key, key_bound, bound_active, bound_memo)) {
+							// A static bound narrows the mapped rows below the probe extent.
+							const uint64_t key_count = key_bound / table_stride + 1u;
+							if (key_count <= MaxIndirectDescriptorProbes) {
+								indirect.key_count = Value(static_cast<uint32_t>(key_count));
+							}
 						}
-						// The scalar-address heap caps its mapped extent at the probe limit: a
-						// bound past it would let a key reach unmapped rows.
-						const uint64_t key_count = key_bound / table_stride + 1u;
-						if (key_count > MaxIndirectDescriptorProbes) return false;
-						indirect.key_count = Value(static_cast<uint32_t>(key_count));
+						uniform = true;
 					}
 					if (!uniform) {
 						return false;
