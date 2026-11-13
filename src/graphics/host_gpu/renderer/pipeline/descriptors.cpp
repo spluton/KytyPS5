@@ -153,7 +153,10 @@ static bool IsCanonicalTextureEncoding(const ShaderTextureResource& descriptor, 
 	// a canonical descriptor may carry an array pitch or a PRT default-color flag, and the
 	// sampled/storage paths read CornerSample elsewhere, so the expected composition includes
 	// them instead of rejecting every descriptor that sets one (PPSA25286 storage writes with
-	// an array pitch). MinLodWarn5 stays out: it is a runtime LOD value, not an encoding field.
+	// an array pitch). MinLodWarn5 (bits 19-8) is a decoded runtime LOD value no Kyty decoder
+	// consumes, so it is masked out of the comparison instead of demanding zeros (PPSA25286
+	// depth descriptors carry MinLodWarn values of 10 and 31).
+	constexpr uint32_t field5_min_lod_warn_mask = 0x000fff00u;
 	const uint32_t     field5_expected = (static_cast<uint32_t>(descriptor.PerfMod5()) << 20u) |
 	                                     (uint32_t {descriptor.CornerSample()} << 23u) |
 	                                     (uint32_t {descriptor.MipStatsCntEn()} << 25u) |
@@ -168,7 +171,8 @@ static bool IsCanonicalTextureEncoding(const ShaderTextureResource& descriptor, 
 		return descriptor.fields[4] == 0 && descriptor.fields[5] == 0 && descriptor.fields[6] == 0 &&
 		       descriptor.fields[7] == 0;
 	}
-	return descriptor.fields[4] == field4_expected && descriptor.fields[5] == field5_expected;
+	return descriptor.fields[4] == field4_expected &&
+	       (descriptor.fields[5] & ~field5_min_lod_warn_mask) == field5_expected;
 }
 
 bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, const Image& image,
@@ -684,41 +688,69 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (!ResolveTextureMipView(desc.info, physical_levels,
 		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
 		                           view_base)) {
-			std::string parent_text;
+			// ASSUMPTION, not verified on hardware: a view spanning more levels than the
+			// descriptor's own MAX_MIP chain samples clamped on the console (levels past the
+			// chain return the last real mip). PPSA25286 binds such descriptors
+			// (LAST_LEVEL=10 over MAX_MIP=2) whose full mip chain a sibling descriptor has
+			// already allocated as an image over the same memory. Binding the view onto that
+			// existing image reproduces the hardware reads without changing its layout: the
+			// identity check below matches it by the recomputed full-chain size, and only a
+			// descriptor whose chain nobody allocated still fails.
+			desc.info.UpdateSize();
 			const auto  parent_id = texture_cache.FindImageFromRange(address, 0x2000000, false);
-			if (parent_id) {
-				const auto& p = texture_cache.GetImage(parent_id).info;
-				parent_text = fmt::sprintf(
-				"parent image: addr=%016" PRIx64 " size=%" PRIu64 " levels=%u layers=%u "
-				"extent=%ux%ux%u tile=%u fmt=%u ftt=%u stride=%" PRIu64 "\n",
-				p.data.address, p.data.size, p.resources.levels, p.resources.layers,
-				p.extent.width, p.extent.height, p.extent.depth,
-				static_cast<uint32_t>(p.tile_mode), static_cast<uint32_t>(p.guest_format),
-				p.first_tail_level, p.tiled_slice_stride);
+			const auto* parent =
+			    parent_id ? &texture_cache.GetImage(parent_id) : nullptr;
+			const bool parent_covers = parent != nullptr && parent->registered &&
+			    parent->info.data.address == address &&
+			    parent->info.data.size >= desc.info.data.size &&
+			    parent->info.resources.levels >= desc.info.resources.levels &&
+			    parent->info.resources.layers >= desc.info.resources.layers;
+			if (parent_covers) {
+				static std::atomic_bool logged = false;
+				if (!logged.exchange(true)) {
+					LOGF_COLOR(Log::Color::BrightYellow,
+					           "mip view: %u-level view over a %u-level descriptor bound onto the "
+					           "existing full-chain image (assumption, unverified on hardware): "
+					           "data=%016llx\n",
+					           desc.info.resources.levels, physical_levels,
+					           static_cast<unsigned long long>(address));
+				}
 			} else {
-				parent_text = fmt::sprintf("parent image: none at %016" PRIx64 "\n", address);
+				std::string parent_text;
+				if (parent_id) {
+					const auto& p = texture_cache.GetImage(parent_id).info;
+					parent_text = fmt::sprintf(
+					"parent image: addr=%016" PRIx64 " size=%" PRIu64 " levels=%u layers=%u "
+					"extent=%ux%ux%u tile=%u fmt=%u ftt=%u stride=%" PRIu64 "\n",
+					p.data.address, p.data.size, p.resources.levels, p.resources.layers,
+					p.extent.width, p.extent.height, p.extent.depth,
+					static_cast<uint32_t>(p.tile_mode), static_cast<uint32_t>(p.guest_format),
+					p.first_tail_level, p.tiled_slice_stride);
+				} else {
+					parent_text = fmt::sprintf("parent image: none at %016" PRIx64 "\n", address);
+				}
+				EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
+				     "extent=%ux%ux%u tile=%u\n"
+				     "  addr=%016" PRIx64 " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n"
+				     "  view   levels=%u ftt=%u stride=%" PRIu64 " mip[base]: off=%012" PRIx64
+				     " sz=%012" PRIx64 " pitch=%u h=%u tx=%u ty=%u sz=%u\n"
+				     "  phys   levels=%u ftt=%u stride=%" PRIu64 " mip[0]:    off=%012" PRIx64
+				     " sz=%012" PRIx64 " pitch=%u h=%u tx=%u ty=%u sz=%u\n%s",
+				     base_level, last_level, max_mip, width, height, depth,
+				     static_cast<uint32_t>(tile), address, descriptor.fields[0], descriptor.fields[1],
+				     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
+				     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7],
+				     desc.info.resources.levels, desc.info.first_tail_level,
+				     desc.info.tiled_slice_stride, desc.info.mip_layout[view_base].offset,
+				     desc.info.mip_layout[view_base].size, desc.info.mip_layout[view_base].pitch,
+				     desc.info.mip_layout[view_base].height, desc.info.mip_layout[view_base].tail_x,
+				     desc.info.mip_layout[view_base].tail_y, desc.info.mip_layout[view_base].surface_z,
+				     physical_levels, desc.info.first_tail_level, desc.info.tiled_slice_stride,
+				     desc.info.mip_layout[0].offset, desc.info.mip_layout[0].size,
+				     desc.info.mip_layout[0].pitch, desc.info.mip_layout[0].height,
+				     desc.info.mip_layout[0].tail_x, desc.info.mip_layout[0].tail_y,
+				     desc.info.mip_layout[0].surface_z, parent_text.c_str());
 			}
-			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
-			     "extent=%ux%ux%u tile=%u\n"
-			     "  addr=%016" PRIx64 " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n"
-			     "  view   levels=%u ftt=%u stride=%" PRIu64 " mip[base]: off=%012" PRIx64
-			     " sz=%012" PRIx64 " pitch=%u h=%u tx=%u ty=%u sz=%u\n"
-			     "  phys   levels=%u ftt=%u stride=%" PRIu64 " mip[0]:    off=%012" PRIx64
-			     " sz=%012" PRIx64 " pitch=%u h=%u tx=%u ty=%u sz=%u\n%s",
-			     base_level, last_level, max_mip, width, height, depth,
-			     static_cast<uint32_t>(tile), address, descriptor.fields[0], descriptor.fields[1],
-			     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
-			     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7],
-			     desc.info.resources.levels, desc.info.first_tail_level,
-			     desc.info.tiled_slice_stride, desc.info.mip_layout[view_base].offset,
-			     desc.info.mip_layout[view_base].size, desc.info.mip_layout[view_base].pitch,
-			     desc.info.mip_layout[view_base].height, desc.info.mip_layout[view_base].tail_x,
-			     desc.info.mip_layout[view_base].tail_y, desc.info.mip_layout[view_base].surface_z,
-			     physical_levels, desc.info.first_tail_level, desc.info.tiled_slice_stride,
-			     desc.info.mip_layout[0].offset, desc.info.mip_layout[0].size,
-			     desc.info.mip_layout[0].pitch, desc.info.mip_layout[0].height,
-			     desc.info.mip_layout[0].tail_x, desc.info.mip_layout[0].tail_y,
-			     desc.info.mip_layout[0].surface_z, parent_text.c_str());
 		}
 	} else {
 		desc.info.UpdateSize();
