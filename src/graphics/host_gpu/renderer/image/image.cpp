@@ -667,7 +667,14 @@ void Validate(const ImageInfo& info) {
 			if (!GuestRange {info.metadata.range.address,
 			                 std::max<uint64_t>(info.metadata.range.size, 1)}.Valid() ||
 			    info.metadata.compression == VideoOutCompression::Unsupported) {
-				EXIT("invalid color metadata\n");
+				EXIT("invalid color metadata: range=%016llx+%016llx compression=%d "
+				     "addr=%016llx extent=%ux%ux%u fmt=%u tile=%u\n",
+				     static_cast<unsigned long long>(info.metadata.range.address),
+				     static_cast<unsigned long long>(info.metadata.range.size),
+				     static_cast<int>(info.metadata.compression),
+				     static_cast<unsigned long long>(info.data.address), info.extent.width,
+				     info.extent.height, info.extent.depth,
+				     static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode));
 			}
 			break;
 	}
