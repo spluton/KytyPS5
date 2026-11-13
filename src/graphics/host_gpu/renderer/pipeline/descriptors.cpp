@@ -646,7 +646,30 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.info.samples   = samples;
 	desc.info.tile_mode = tile;
 	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
-		desc.info.metadata.kind = ImageMetadataKind::Dcc;
+		// ASSUMPTION, not verified on hardware: a compression enable only describes the
+		// surface when its DCC buffer is a real allocation the game reads the color plane
+		// through. PPSA25286 recycles color descriptors with stale compression fields over
+		// garbage metadata pointers (0x475500000000), which cannot function, so such a
+		// descriptor is accepted as metadata-free; a real pointer keeps the DCC encoding.
+		const auto metadata_addr = descriptor.MetaAddr() << 8u;
+		TileSizeAlign metadata_size {};
+		(void)TileGetDccSize(width, height, volume ? depth : image_layers,
+		                     desc.info.bytes_per_block, physical_levels, tile, metadata_size,
+		                     std::countr_zero(samples));
+		if (GuestRange {metadata_addr, std::max<uint64_t>(metadata_size.size, 1)}.Valid()) {
+			desc.info.metadata.kind  = ImageMetadataKind::Dcc;
+			desc.info.metadata.range = {metadata_addr, metadata_size.size};
+		} else {
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true)) {
+				LOGF_COLOR(Log::Color::BrightYellow,
+				           "color encoding: compression-enabled descriptor accepted as "
+				           "metadata-free (assumption, unverified on hardware): data=%016llx "
+				           "meta=%016llx f6=%08x\n",
+				           static_cast<unsigned long long>(address),
+				           static_cast<unsigned long long>(metadata_addr), descriptor.fields[6]);
+			}
+		}
 	}
 	if (resource.heap) {
 		// Image heaps keep the descriptors of unmapped textures, which PS5 never samples. An
@@ -710,12 +733,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
 	}
-	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
-		TileSizeAlign metadata_size {};
-		(void)TileGetDccSize(width, height, volume ? depth : image_layers,
-		                     desc.info.bytes_per_block, physical_levels, tile, metadata_size,
-		                     std::countr_zero(samples));
-		desc.info.metadata.range         = {descriptor.MetaAddr() << 8u, metadata_size.size};
+	if (desc.info.metadata.kind == ImageMetadataKind::Dcc) {
+		// The metadata range was validated and assigned at the kind decision above.
 		desc.info.metadata.dcc_alpha_msb = descriptor.DccAlphaPos();
 	}
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
