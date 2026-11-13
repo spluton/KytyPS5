@@ -1244,10 +1244,11 @@ private:
 
 	// Wave-uniform by construction: every lane-varying leaf of the derivation folds through a
 	// first-lane read (which broadcasts lane 0's value), and everything else is immediate,
-	// scalar-uniform input, deterministic uniform-preserving arithmetic or a scalar memory read
-	// whose address is wave-uniform (every lane of the wave observes the same location). Unlike
-	// the runtime validator this proves uniformity, not host evaluability: the heap resolves
-	// such keys from guest memory, so values the walker cannot reproduce are fine here.
+	// scalar-uniform input (user data, the per-draw SRT flat values of flattened scalar reads),
+	// deterministic uniform-preserving arithmetic or a scalar memory read whose address is
+	// wave-uniform (every lane of the wave observes the same location). Unlike the runtime
+	// validator this proves uniformity, not host evaluability: the heap resolves such keys from
+	// guest memory, so values the walker cannot reproduce are fine here.
 	// Revisiting a node counts as uniform: the only cycles in SSA run through a loop Phi, whose
 	// carried value stays uniform exactly when every non-carried input is, so a back-edge to a
 	// uniform-by-assumption node adds no lane variance (a node only reaches this check while its
@@ -1264,7 +1265,7 @@ private:
 		if (!visited.insert(inst).second) return true;
 		const auto op = inst->GetOpcode();
 		if (op == ValueOpcode::ReadFirstLane || op == ValueOpcode::GetUserData ||
-		    op == ValueOpcode::GetShaderBase) {
+		    op == ValueOpcode::GetShaderBase || op == ValueOpcode::GetSrtResource) {
 			return true;
 		}
 		// Descriptor handles name their uniform-selected resource; the key's loads fetch a
@@ -1329,6 +1330,23 @@ private:
 			if (!left_known || !right_known) return finish(false);
 			bound = std::min(left, right);
 			return finish(true);
+		}
+		if (op == ValueOpcode::UMin32) {
+			uint32_t left = 0, right = 0;
+			const bool left_known = StaticKeyBound(inst->Arg(0), left, active, memo);
+			const bool right_known = StaticKeyBound(inst->Arg(1), right, active, memo);
+			if (left_known && right_known) {
+				bound = std::min(left, right);
+				return finish(true);
+			}
+			// min(x, c) is capped by c on every evaluation, even when the other side is an
+			// unbounded loop value: the clamp re-applies to each iteration's row index.
+			uint32_t limit = 0;
+			if (ImmediateU32(inst->Arg(0), limit) || ImmediateU32(inst->Arg(1), limit)) {
+				bound = limit;
+				return finish(true);
+			}
+			return finish(false);
 		}
 		if (op == ValueOpcode::IMul32) {
 			uint32_t left = 0, right = 0;
@@ -3530,9 +3548,15 @@ private:
 						if (!StaticKeyBound(key, key_bound, bound_active, bound_memo)) {
 							return false;
 						}
-						indirect.key_count = Value(key_bound / table_stride + 1u);
+						// The scalar-address heap caps its mapped extent at the probe limit: a
+						// bound past it would let a key reach unmapped rows.
+						const uint64_t key_count = key_bound / table_stride + 1u;
+						if (key_count > MaxIndirectDescriptorProbes) return false;
+						indirect.key_count = Value(static_cast<uint32_t>(key_count));
 					}
-					if (!uniform) return false;
+					if (!uniform) {
+						return false;
+					}
 					indirect.table_scalar = true;
 					plan.table_read       = plan.reads[0];
 					plan.retain_reads     = true;
