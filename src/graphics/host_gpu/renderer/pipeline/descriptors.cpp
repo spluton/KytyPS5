@@ -171,32 +171,59 @@ static bool IsCanonicalTextureEncoding(const ShaderTextureResource& descriptor, 
 	return descriptor.fields[4] == field4_expected && descriptor.fields[5] == field5_expected;
 }
 
-bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bool r128) {
+bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, const Image& image,
+                                     bool r128) {
 	if (!IsCanonicalTextureEncoding(descriptor, r128)) {
 		return false;
 	}
 	if (r128) {
 		return true;
 	}
+	// ASSUMPTION, not verified on hardware: a compression enable only describes the surface
+	// when its HTile buffer is a real pipe-aligned allocation, which the game reads the depth
+	// plane through. PPSA25286 samples a plain single-sample depth16 surface whose descriptor
+	// carries a recycled control set (MSAA_DEPTH on a non-multisampled type, compressed-
+	// metadata bits) over a metadata pointer that is not a 32 KiB aligned allocation (address
+	// 0x210A00, offset 0xA00), so the metadata cannot function and the plane is accepted as
+	// plain depth. If the hardware tolerates such a pointer and still compresses the plane,
+	// this acceptance would read garbage; unproven, so the acceptance is logged once.
+	const auto metadata_addr = descriptor.MetaAddr() << 8u;
+	const bool metadata_usable = descriptor.MetaCompress() &&
+	                             GuestRange {metadata_addr, 1}.Valid() &&
+	                             (metadata_addr & 0x7fffu) == 0;
+	if (!metadata_usable) {
+		if (descriptor.MetaCompress()) {
+			// The image may be a depth target whose own descriptor registered real HTile
+			// metadata over the same data: then the compression is genuinely in effect and
+			// must not be accepted as plain depth.
+			if (image.info.metadata.kind == ImageMetadataKind::Htile) {
+				return false;
+			}
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true)) {
+				LOGF_COLOR(Log::Color::BrightYellow,
+				           "depth encoding: compression-enabled descriptor accepted as plain "
+				           "depth (assumption, unverified on hardware): data=%016llx meta=%016llx "
+				           "f6=%08x\n",
+				           static_cast<unsigned long long>(descriptor.Base40()),
+				           static_cast<unsigned long long>(metadata_addr), descriptor.fields[6]);
+			}
+		}
+		return true;
+	}
 	// MSAA_DEPTH only marks the compressed tiling of a multisampled depth surface: a
 	// single-sample surface reads the same with the bit set, so a stale bit on a
-	// non-multisampled type (PPSA25286 binds a depth16 2D texture with one) reads as ignored.
-	if (descriptor.MsaaDepth() && !IsMultisampledTexture(descriptor.Type()) &&
-	    descriptor.MetaCompress()) {
+	// non-multisampled type reads as ignored.
+	if (descriptor.MsaaDepth() && !IsMultisampledTexture(descriptor.Type())) {
 		return false;
 	}
 	// Bits 0-7 name the mip-stats counter. A clear COMPRESSION_EN disables the metadata and its
 	// settings.
 	const auto         metadata_control = descriptor.fields[6] & 0x00ffff00u;
 	constexpr uint32_t pipe_aligned     = 1u << 19u;
-	if (!descriptor.MetaCompress()) {
-		return true;
-	}
-	constexpr uint32_t htile_control = pipe_aligned | 1u << 21u;
-	const uint32_t expected_control  = htile_control | (descriptor.MsaaDepth() ? (1u << 10u) : 0u);
-	const auto     metadata_addr     = descriptor.MetaAddr() << 8u;
-	return metadata_control == expected_control && GuestRange {metadata_addr, 1}.Valid() &&
-	       (metadata_addr & 0x7fffu) == 0 &&
+	constexpr uint32_t htile_control    = pipe_aligned | 1u << 21u;
+	const uint32_t expected_control    = htile_control | (descriptor.MsaaDepth() ? (1u << 10u) : 0u);
+	return metadata_control == expected_control &&
 	       descriptor.TileMode() == Prospero::TileMode::kDepth;
 }
 
@@ -206,7 +233,7 @@ static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
 	const bool resource_ok = IsSupportedSampledDepthResource(resource);
 	// Comparison sampling changes the host format, not the guest metadata encoding.
 	const bool encoding_ok = descriptor.TileMode() != Prospero::TileMode::kDepth ||
-	                         IsSupportedDepthTextureEncoding(descriptor, resource.r128);
+	                         IsSupportedDepthTextureEncoding(descriptor, image, resource.r128);
 	const bool view_ok =
 	    IsSupportedSampledDepthView(image.info.pixel_format, view_format, descriptor.DstSelXYZW());
 	if (resource_ok && encoding_ok && view_ok) {
