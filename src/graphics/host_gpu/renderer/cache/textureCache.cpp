@@ -837,15 +837,11 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			            ? result_id
 			            : ImageId {}};
 		}
-		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
-		     " requested=%ux%u "
-		     "cached=%ux%u requested_size=0x%016" PRIx64 " cached_size=0x%016" PRIx64
-		     " type=%u/%u tile=%u/%u\n",
-		     requested.data.address, requested.resources.levels, requested.resources.layers,
-		     cached.info.resources.levels, cached.info.resources.layers, requested.data.size,
-		     cached.info.data.size, static_cast<uint32_t>(requested.type),
-		     static_cast<uint32_t>(cached.info.type), static_cast<uint32_t>(requested.tile_mode),
-		     static_cast<uint32_t>(cached.info.tile_mode));
+		// The request needs more memory than the cached image holds over the same guest range
+		// (recycled memory rebinds a bigger geometry, PPSA25286 level data): recreate the
+		// cached image with the requested geometry instead of failing the overlap.
+		return {ExpandImage(requested, merged_id ? merged_id : cached_id)};
+	}
 	}
 
 	const int32_t requested_mip = requested.MipOf(cached.info);
