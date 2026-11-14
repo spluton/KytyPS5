@@ -842,7 +842,6 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		// cached image with the requested geometry instead of failing the overlap.
 		return {ExpandImage(requested, merged_id ? merged_id : cached_id)};
 	}
-	}
 
 	const int32_t requested_mip = requested.MipOf(cached.info);
 	if (requested_mip >= 0) {
