@@ -633,6 +633,9 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		GpuActivityRows(shown);
 		Row("Instances", Fmt("%.0f/frame", Rate(shown, Counter::DrawInstances) / fps));
 		Row("Indirect draws", Fmt("%.0f/s", Rate(shown, Counter::IndirectDraws)));
+		const auto clamps = Rate(shown, Counter::IndirectClamps);
+		Row("Indirect clamps", Fmt("%.0f/s", clamps), clamps > 0.0 ? BAD : GOOD);
+		Row("Heap recheck elements", Fmt("%.0f/s", Rate(shown, Counter::HeapChangeElements)));
 		Row("Dispatches", Fmt("%.0f/frame  %.0f/s", Rate(shown, Counter::Dispatches) / fps,
 		                      Rate(shown, Counter::Dispatches)));
 		Row("Queue submits", Fmt("%.0f/s", Rate(shown, Counter::QueueSubmits)));

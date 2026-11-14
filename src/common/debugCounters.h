@@ -16,6 +16,8 @@ enum class Counter {
 	Draws,
 	DrawInstances,
 	IndirectDraws,
+	IndirectClamps, // Indirect records whose counts the host clamped as garbage.
+	HeapChangeElements, // Image-heap elements a draw rechecks over image changes.
 	Dispatches,
 	QueueSubmits,
 	GpuWaits, // CPU blocked on a GPU timeline semaphore.

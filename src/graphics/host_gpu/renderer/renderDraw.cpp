@@ -443,6 +443,75 @@ struct DrawCallInfo {
 	[[nodiscard]] const char* Name() const { return indexed ? "DrawIndex" : "DrawIndexAuto"; }
 };
 
+// Indirect records are guest memory the GPU reads at draw time: compute streams write them
+// during the frame, so the CPU-visible bytes can hold garbage. A record reaching past the
+// bound index buffer faults the device; the hardware fetches indices past the index buffer
+// as zero, so clamping index_count to the bound reproduces the guest. Counts without a guest
+// bound get caps no legitimate draw reaches: a record beyond one is garbage, and hours of
+// emulated work trip the driver's device reset. UNVERIFIED: the caps assume no legitimate
+// draw exceeds them.
+std::pair<Buffer*, uint64_t> ClampIndirectDrawRecords(RenderContext&                 context,
+                                                     const DrawCallInfo&            draw,
+                                                     const DrawIndirectArgs&        indirect,
+                                                     const std::pair<Buffer*, uint64_t>& args) {
+	constexpr uint32_t MaxInstances = 1u << 20u;
+	constexpr uint32_t MaxVertices  = 1u << 24u;
+	static std::atomic<bool> reported = {false};
+	EXIT_IF(args.first->CpuAddress() == 0);
+	const auto* words        = reinterpret_cast<const uint32_t*>(args.first->CpuAddress() +
+	                                                          args.second);
+	const auto  stride_words = indirect.stride / 4u;
+	uint32_t    clamped         = 0;
+	uint32_t    worst_instances = 0;
+	uint32_t    worst_indices   = 0;
+	uint32_t    worst_vertices  = 0;
+	for (uint64_t record = 0; record < indirect.count; ++record) {
+		const auto* fields    = words + record * stride_words;
+		const auto  instances = fields[1];
+		worst_instances       = std::max(worst_instances, instances);
+		if (draw.indexed) {
+			const auto bound = draw.index_count < fields[2] ? 0u : draw.index_count - fields[2];
+			worst_indices    = std::max(worst_indices, fields[0]);
+			if (fields[0] <= bound && instances <= MaxInstances) {
+				continue;
+			}
+		} else {
+			worst_vertices = std::max(worst_vertices, fields[0]);
+			if (fields[0] <= MaxVertices && instances <= MaxInstances) {
+				continue;
+			}
+		}
+		++clamped;
+	}
+	if (clamped == 0) {
+		return args;
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectClamps, clamped);
+	if (!reported.exchange(true)) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "GPU: clamped counts of {}/{} indirect records at tick {} (indexed: {}, index bound: "
+		    "{}, worst index_count: {}, instance_count: {}, vertex_count: {}); UNVERIFIED caps\n",
+		    clamped, indirect.count, context.GetCommandScheduler().CurrentTick(), draw.indexed,
+		    draw.index_count, worst_indices, worst_instances, worst_vertices));
+	}
+	// The records stay in guest memory; the draw reads a clamped copy instead.
+	const auto            bytes = static_cast<uint64_t>(indirect.count) * indirect.stride;
+	std::vector<uint32_t> fixed(bytes / 4u);
+	std::copy(words, words + bytes / 4u, fixed.begin());
+	for (uint64_t record = 0; record < indirect.count; ++record) {
+		auto* fields = fixed.data() + record * stride_words;
+		if (draw.indexed) {
+			const auto bound = draw.index_count < fields[2] ? 0u : draw.index_count - fields[2];
+			fields[0]        = std::min(fields[0], bound);
+		} else {
+			fields[0] = std::min(fields[0], MaxVertices);
+		}
+		fields[1] = std::min(fields[1], MaxInstances);
+	}
+	auto& stream = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+	return {&stream, stream.Copy(fixed.data(), bytes, sizeof(uint32_t))};
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
@@ -1138,6 +1207,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		                                : sizeof(vk::DrawIndirectCommand));
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
+		// Mesh records are a payload the task shader bounds itself; only draw records have
+		// counts to clamp.
+		if (!mesh_active) {
+			args_buffer = ClampIndirectDrawRecords(m_context, draw, emit.indirect, args_buffer);
+		}
 	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
 	vk::ImageAspectFlags feedback_aspects;
