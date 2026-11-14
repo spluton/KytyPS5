@@ -1291,6 +1291,65 @@ private:
 		return true;
 	}
 
+	// Walker-evaluable: every node is immediate, scalar-uniform input, an SRT flat value, a
+	// loop-invariant Phi or uniform-preserving arithmetic — guest loads are NOT accepted (the
+	// runtime SRT walker cannot execute them), so a value passing this check is computable
+	// per draw by EvaluateIndirectCount's walker.
+	bool WalkerEvaluableValue(Value value, std::unordered_set<const Inst*>& visited) const {
+		value = value.Resolve();
+		if (value.IsImmediate()) return true;
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return (value.GetType() & Type::ScalarReg) != Type::Void &&
+			       (value.GetType() & Type::VectorReg) == Type::Void;
+		}
+		if (!visited.insert(inst).second) return true;
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::ReadConst || op == ValueOpcode::GetUserData ||
+		    op == ValueOpcode::GetShaderBase || op == ValueOpcode::GetSrtResource) {
+			return true;
+		}
+		if (op == ValueOpcode::Phi) {
+			for (size_t index = 0; index < inst->NumArgs(); index++) {
+				if (!WalkerEvaluableValue(inst->Arg(index), visited)) return false;
+			}
+			return true;
+		}
+		if (!IsRuntimeUniformOp(op)) return false;
+		for (size_t index = 0; index < inst->NumArgs(); index++) {
+			if (!WalkerEvaluableValue(inst->Arg(index), visited)) return false;
+		}
+		return true;
+	}
+
+	// The runtime row limit of the key: the operand of a UMin32 clamp in the derivation whose
+	// other side is the unbounded index chain. Only a walker-evaluable U32 limit is returned;
+	// the materialization evaluates it per draw through the SRT walker.
+	Value RuntimeKeyLimit(Value key, std::unordered_set<const Inst*>& visited) const {
+		key = key.Resolve();
+		const auto* inst = key.TryInstruction();
+		if (inst == nullptr || !visited.insert(inst).second) return {};
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::UMin32) {
+			std::unordered_set<const Inst*> left_visited;
+			std::unordered_set<const Inst*> right_visited;
+			const bool left_uniform = WalkerEvaluableValue(inst->Arg(0), left_visited);
+			const bool right_uniform = WalkerEvaluableValue(inst->Arg(1), right_visited);
+			if (left_uniform == right_uniform) return {};
+			const auto& limit = left_uniform ? inst->Arg(0) : inst->Arg(1);
+			if (limit.Resolve().GetType() != Type::U32 ||
+			    !ValidateRuntimeValue(m_program, limit, RuntimeValueType::Integer)) {
+				return {};
+			}
+			return limit;
+		}
+		for (size_t index = 0; index < inst->NumArgs(); ++index) {
+			auto found = RuntimeKeyLimit(inst->Arg(index), visited);
+			if (!found.IsEmpty()) return found;
+		}
+		return {};
+	}
+
 	// An upper bound on the byte offset a derivation can produce, when every branch masks or
 	// scales it with immediates. The bound (and through it the heap's key_count row extent)
 	// comes only from masks, shifts and multiplications by immediates: loads and live inputs
@@ -3547,17 +3606,40 @@ private:
 						// of such a key bounds-checks the same way (the image heap entry and
 						// the indirect resource index); a static bound, when derivable, only
 						// narrows the mapped rows.
-						std::unordered_set<const Inst*> bound_active;
-						std::map<const Inst*, std::optional<uint32_t>> bound_memo;
-						uint32_t key_bound = 0;
-						if (StaticKeyBound(key, key_bound, bound_active, bound_memo)) {
-							// A static bound narrows the mapped rows below the probe extent.
-							const uint64_t key_count = key_bound / table_stride + 1u;
-							if (key_count <= MaxIndirectDescriptorProbes) {
-								indirect.key_count = Value(static_cast<uint32_t>(key_count));
+					std::unordered_set<const Inst*> bound_active;
+					std::map<const Inst*, std::optional<uint32_t>> bound_memo;
+					uint32_t key_bound = 0;
+					if (StaticKeyBound(key, key_bound, bound_active, bound_memo)) {
+						// A static bound narrows the mapped rows below the probe extent.
+						const uint64_t key_count = key_bound / table_stride + 1u;
+						if (key_count <= MaxIndirectDescriptorProbes) {
+							indirect.key_count = Value(static_cast<uint32_t>(key_count));
+						}
+					} else {
+						// The index is clamped by UMin32(x, L) with L a flattened SRT value:
+						// the limit sizes the mapped extent per draw (EvaluateIndirectCount's
+						// walker computes it), while read correctness stays with the
+						// shader-side slot clamp and the trailing null slot. The mapped byte
+						// extent is (L+1) rows of the table stride.
+						std::unordered_set<const Inst*> limit_visited;
+						const auto limit = RuntimeKeyLimit(key, limit_visited);
+						if (!limit.IsEmpty() && table_stride != 0u &&
+						    uint64_t {limit.Resolve().U32()} + 1u <=
+						            uint64_t {MaxIndirectDescriptorProbes} * table_stride &&
+						    ValidateRuntimeValue(m_program, limit, RuntimeValueType::Integer)) {
+							auto& rows = m_program.value_storage.emplace_back(ValueOpcode::IAdd32);
+							rows.SetArg(0, limit);
+							rows.SetArg(1, Value(1u));
+							auto& bytes = m_program.value_storage.emplace_back(ValueOpcode::IMul32);
+							bytes.SetArg(0, Value(&rows));
+							bytes.SetArg(1, Value(static_cast<uint32_t>(table_stride)));
+							if (ValidateRuntimeValue(m_program, Value(&bytes),
+							                         RuntimeValueType::Integer)) {
+								indirect.key_count = Value(&bytes);
 							}
 						}
-						uniform = true;
+					}
+					uniform = true;
 					}
 					if (!uniform) {
 						return false;
@@ -3614,6 +3696,27 @@ private:
 					indirect.table_record_bytes = table_immediate + plan.read_dwords * 4u;
 				} else {
 					indirect.table_scalar = true;
+					// The same runtime-limit sizing as the scalar-address escape above: a key
+					// clamped by UMin32(x, L) with L a flattened SRT value maps (L+1) rows of
+					// the table stride instead of the full probe extent; read correctness
+					// stays with the shader-side slot clamp and the trailing null slot.
+					std::unordered_set<const Inst*> limit_visited;
+					const auto limit = RuntimeKeyLimit(key, limit_visited);
+					if (!limit.IsEmpty() && table_stride != 0u &&
+					    uint64_t {limit.Resolve().U32()} + 1u <=
+					            uint64_t {MaxIndirectDescriptorProbes} * table_stride &&
+					    ValidateRuntimeValue(m_program, limit, RuntimeValueType::Integer)) {
+						auto& rows = m_program.value_storage.emplace_back(ValueOpcode::IAdd32);
+						rows.SetArg(0, limit);
+						rows.SetArg(1, Value(1u));
+						auto& bytes = m_program.value_storage.emplace_back(ValueOpcode::IMul32);
+						bytes.SetArg(0, Value(&rows));
+						bytes.SetArg(1, Value(static_cast<uint32_t>(table_stride)));
+						if (ValidateRuntimeValue(m_program, Value(&bytes),
+						                         RuntimeValueType::Integer)) {
+							indirect.key_count = Value(&bytes);
+						}
+					}
 				}
 			}
 			plan.retain_reads = true;

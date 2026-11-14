@@ -750,10 +750,20 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			const auto child_count = pointer != nullptr ? pointer->count : 1u;
 			uint64_t domain = indirect.table_maximum ? uint64_t {*indirect.table_maximum} + 1u
 			                                       : uint64_t {1} << 32u;
+			// A runtime key_count (a non-immediate limit value) is evaluated per draw through
+			// the SRT walker with no caching between draws. When the limit is not walker-
+			// evaluable this draw, map nothing rather than garbage: the image reads as the
+			// null slot.
+			const bool runtime_key_count =
+			    !indirect.key_count.IsEmpty() && !indirect.key_count.IsImmediate();
 			if (!indirect.key_count.IsEmpty()) {
 				uint32_t key_count = 0u;
-				if (!EvaluateIndirectCount(program, indirect, runtime, key_count)) return false;
-				domain = std::min(domain, uint64_t {key_count});
+				if (!EvaluateIndirectCount(program, indirect, runtime, key_count)) {
+					if (!runtime_key_count) return false;
+					domain = 0u;
+				} else {
+					domain = std::min(domain, uint64_t {key_count});
+				}
 			}
 			if (indexed_pointer &&
 			    (!indirect.table_maximum || table.Type() != 0u || table.SwizzleEnabled() || table.AddTid() ||
@@ -777,15 +787,30 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				domain = std::min(domain, uint64_t {MaxIndirectDescriptorProbes});
 				table_size = first + domain * step;
 			}
-			auto count = table_size >= first + 4u
-			    ? std::min((table_size - first - 4u) / step + 1u, domain)
-			    : 0u;
-			descriptors[resource_index] = {.dword_count = dword_count};
-			if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
-				const auto& image = program.info.images[resource_index];
-				// A resident heap maps slot words instead of materializing its entries.
-				ImageHeapView view;
-				if (image_heap && runtime.image_heap != nullptr &&
+				auto count = table_size >= first + 4u
+				    ? std::min((table_size - first - 4u) / step + 1u, domain)
+				    : 0u;
+				descriptors[resource_index] = {.dword_count = dword_count};
+				// A runtime-sized extent must lie inside readable guest memory: do not map
+				// garbage. The specialization read callback resolves through the same page
+				// mappings the walker uses, so its failure means the extent is not backed.
+				if (runtime_key_count) {
+					const auto readable = [&](uint64_t check_address) {
+						uint32_t word = 0u;
+						return runtime.read_specialization_memory != nullptr &&
+						       runtime.read_specialization_memory(runtime.userdata, check_address,
+						                                          std::span {&word, 1u});
+					};
+					if (table_size < 4u || !readable(table_base) ||
+					    !readable(table_base + table_size - 4u)) {
+						return true;
+					}
+				}
+				if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
+					const auto& image = program.info.images[resource_index];
+					// A resident heap maps slot words instead of materializing its entries.
+					ImageHeapView view;
+					if (image_heap && runtime.image_heap != nullptr &&
 				    image.resource_class == ImageResourceClass::Sampled &&
 				    image.mip_mode != ImageMipMode::Dynamic &&
 				    runtime.image_heap->Acquire({table_base, table_size, step, first, count, &image},
