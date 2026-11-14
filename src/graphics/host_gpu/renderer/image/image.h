@@ -125,10 +125,17 @@ public:
 	void HeapChanged() const noexcept {
 		if (heap_refs.load(std::memory_order_relaxed) != 0u) {
 			heap_epoch.fetch_add(1u, std::memory_order_relaxed);
+			// The heap follows the individual change instead of rescanning every element.
+			if (const auto notify = heap_change_notify.load(std::memory_order_acquire)) {
+				notify(heap_id);
+			}
 		}
 	}
 
 	static inline std::atomic<uint64_t> heap_epoch {0};
+	// The resident image heap's change hook, set while a heap exists. The slot id alone
+	// identifies the image: elements revalidate it through Image::serial.
+	static inline std::atomic<void (*)(uint32_t)> heap_change_notify {nullptr};
 	static inline std::atomic<uint64_t> serials {0};
 
 	// Unique per image, unlike ImageId: freed slots are reused.
@@ -138,6 +145,7 @@ public:
 	std::vector<CachedImageView> views;
 	ImageUsage       usage;
 	ImageBinding     binding;
+	uint32_t         heap_id        = 0; // The slot id, stamped when the image registers.
 	bool             registered     = false;
 	mutable bool     picked         = false; // Set only while FindImagesInRegion collects it.
 	uint64_t         track_addr     = 0;

@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -89,9 +90,9 @@ private:
 		size_t                  dirty_end     = 0;
 		size_t                  changed_begin = 0; // Table bytes changed since it was probed.
 		size_t                  changed_end   = 0;
-		uint64_t                resolve_epoch = 0;
-		uint64_t                layout_epoch  = 0;
-		uint64_t                held_serial   = 0; // Image::serials when held was last retried.
+		bool                    recheck_stale = false; // A change marked one of its elements.
+		uint64_t                held_serial   = 0;     // Image::serials when held was last retried.
+		uint64_t                last_tick     = 0;     // The tick that last bound its slots.
 	};
 
 	struct Memory {
@@ -122,11 +123,26 @@ private:
 	void     Retire(View& view);
 	void     Resize(Memory& memory, uint64_t size);
 	void     WriteDescriptors();
+	// The heap follows image changes element by element: a change registers the image's
+	// referencing views here, and the next draw rechecks just those elements. A full pass
+	// per change rescans every element of every view, which a streaming game drives
+	// thousands of times per frame.
+	static void HeapImageChanged(uint32_t image_id);
+	void        TrackHeapElement(uint32_t image_id, View& view, uint32_t index);
+	void        UntrackHeapElement(uint32_t image_id, View& view, uint32_t index);
+	std::vector<uint32_t> TakeChangedImages();
+	// Frees the elements of views the GPU no longer references and no draw re-acquired.
+	void     EvictStaleViews();
+	void     EvictViewElements(View& view);
 
 	RenderContext&                       m_context;
 	PageManager&                         m_page_manager;
 	std::mutex                           m_mutex; // Fault-visible Memory state and m_memories.
 	std::vector<std::unique_ptr<Memory>> m_memories;
+	// Referencing (view, element) pairs per resident image, and the images whose elements a
+	// draw must recheck. The set is fault-thread fed under m_mutex and drained by Rebind.
+	std::unordered_map<uint32_t, std::vector<std::pair<View*, uint32_t>>> m_image_elements;
+	std::unordered_set<uint32_t>                                          m_changed_images;
 	std::vector<View*>                   m_active; // Acquired since the last commit.
 	uint64_t                             m_draw         = 1;
 	uint64_t                             m_suspend_draw = 0; // m_draw at the last suspend point.
