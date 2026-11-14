@@ -481,6 +481,16 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.image_layout = layout;
 	}
 	if (depth.image_id) {
+		// A sampled resolve in the same draw can replace the depth image over the same
+		// memory (recycled surfaces set needs_rebind); refresh the identity the same way
+		// the color targets do before the final acquisition.
+		auto& depth_image = cache.m_slot_images[depth.image_id];
+		if (!depth_image.registered || depth_image.binding.needs_rebind) {
+			depth_image.binding = {};
+			depth.image_id = cache.FindImage(depth.desc);
+			EXIT_IF(!depth.image_id);
+			BindRenderTarget(depth.image_id);
+		}
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
 		const auto& metadata   = depth.desc.info.metadata;
 		const bool meta_clear =
