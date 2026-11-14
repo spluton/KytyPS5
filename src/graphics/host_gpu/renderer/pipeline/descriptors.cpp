@@ -197,20 +197,19 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, co
 	                             (metadata_addr & 0x7fffu) == 0;
 	if (!metadata_usable) {
 		if (descriptor.MetaCompress()) {
-			// The image may be a depth target whose own descriptor registered real HTile
-			// metadata over the same data: then the compression is genuinely in effect and
-			// must not be accepted as plain depth.
-			if (image.info.metadata.kind == ImageMetadataKind::Htile) {
-				return false;
-			}
+			// A target binding over the same image may have registered real HTile metadata;
+			// that registration belongs to the target path, which tracks the clear state and
+			// renders the plane uncompressed, so the sampled read stays plain depth. Kyty
+			// never interprets HTile contents on the sampled path.
 			static std::atomic_bool logged = false;
 			if (!logged.exchange(true)) {
 				LOGF_COLOR(Log::Color::BrightYellow,
 				           "depth encoding: compression-enabled descriptor accepted as plain "
 				           "depth (assumption, unverified on hardware): data=%016llx meta=%016llx "
-				           "f6=%08x\n",
+				           "f6=%08x image_htile=%d\n",
 				           static_cast<unsigned long long>(descriptor.Base40()),
-				           static_cast<unsigned long long>(metadata_addr), descriptor.fields[6]);
+				           static_cast<unsigned long long>(metadata_addr), descriptor.fields[6],
+				           image.info.metadata.kind == ImageMetadataKind::Htile ? 1 : 0);
 			}
 		}
 		return true;
